@@ -7,7 +7,7 @@ from threading import Thread
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(
@@ -27,8 +27,19 @@ app = FastAPI()
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "Оплатить доступ",
+                url="https://app.lava.top/products/9866fa87-2097-4635-a760-b4eea6bd54fb/70ca1de2-4073-4ca4-abb8-a964003fe500",
+            )
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
-        "Бот подключен. Доступ будет выдаваться автоматически после оплаты."
+        "Нажми кнопку ниже, чтобы оформить подписку на доступ к закрытому каналу.",
+        reply_markup=reply_markup,
     )
 
 
