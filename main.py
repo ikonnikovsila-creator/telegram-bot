@@ -1,9 +1,12 @@
 import asyncio
+import json
 import logging
 import os
-from threading import Thread
 
-from fastapi import FastAPI
+from threading import Thread
+from typing import Optional
+
+from fastapi import FastAPI, Header, HTTPException, Request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -13,9 +16,12 @@ logging.basicConfig(
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не найден в переменных окружения")
+
+LAVA_WEBHOOK_API_KEY = os.getenv("LAVA_WEBHOOK_API_KEY")
+if not LAVA_WEBHOOK_API_KEY:
+    raise RuntimeError("LAVA_WEBHOOK_API_KEY не найден в переменных окружения")
 
 app = FastAPI()
 
@@ -34,6 +40,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def run_bot() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
 
@@ -60,3 +67,50 @@ def startup_event() -> None:
 @app.get("/")
 def root() -> dict:
     return {"status": "ok", "message": "Telegram bot is running"}
+
+
+async def handle_lava_webhook(
+    webhook_type: str,
+    request: Request,
+    x_api_key: Optional[str],
+) -> dict:
+    if x_api_key != LAVA_WEBHOOK_API_KEY:
+        logging.warning(
+            "Lava webhook unauthorized: type=%s ip=%s x_api_key=%s",
+            webhook_type,
+            request.client.host if request.client else "unknown",
+            x_api_key,
+        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    raw_body = await request.body()
+    raw_text = raw_body.decode("utf-8", errors="replace")
+
+    logging.info("Lava webhook received: type=%s", webhook_type)
+    logging.info("Lava webhook headers: %s", dict(request.headers))
+    logging.info("Lava webhook raw body: %s", raw_text)
+
+    try:
+        payload = json.loads(raw_text) if raw_text else {}
+    except json.JSONDecodeError:
+        payload = {"raw_body": raw_text}
+
+    logging.info("Lava webhook parsed payload: %s", payload)
+
+    return {"ok": True, "webhook_type": webhook_type}
+
+
+@app.post("/webhooks/lava/payment")
+async def lava_payment_webhook(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
+) -> dict:
+    return await handle_lava_webhook("payment", request, x_api_key)
+
+
+@app.post("/webhooks/lava/recurring")
+async def lava_recurring_webhook(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
+) -> dict:
+    return await handle_lava_webhook("recurring", request, x_api_key)
