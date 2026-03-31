@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -11,7 +12,13 @@ from typing import Optional
 import psycopg2
 from fastapi import FastAPI, Header, HTTPException, Request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -128,19 +135,10 @@ def save_payment_webhook(webhook_type: str, payload: dict) -> None:
         conn.close()
 
 
-def build_user_email(update: Update) -> str:
-    user = update.effective_user
-    if not user:
-        raise ValueError("Не удалось определить пользователя Telegram")
-
-    if user.username:
-        safe_username = "".join(
-            ch for ch in user.username.lower() if ch.isalnum() or ch in {"_", ".", "-"}
-        )
-        if safe_username:
-            return f"{safe_username}@telegram.local"
-
-    return f"telegram_{user.id}@telegram.local"
+def is_valid_email(email: str) -> bool:
+    email = email.strip()
+    pattern = r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"
+    return bool(re.fullmatch(pattern, email))
 
 
 def create_lava_invoice(email: str, currency: str = DEFAULT_CURRENCY) -> dict:
@@ -210,10 +208,42 @@ def create_lava_invoice(email: str, currency: str = DEFAULT_CURRENCY) -> dict:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_user(update)
 
-    user_email = build_user_email(update)
+    context.user_data["awaiting_email"] = True
+
+    if update.message:
+        await update.message.reply_text(
+            "Отправь свой email для оформления оплаты. После этого я пришлю кнопку оплаты."
+        )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(
+            "Нажми /start, отправь email и получи кнопку оплаты."
+        )
+
+
+async def handle_email_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+
+    if not context.user_data.get("awaiting_email"):
+        return
+
+    email = update.message.text.strip()
+
+    if not is_valid_email(email):
+        await update.message.reply_text(
+            "Это не похоже на корректный email. Отправь нормальный email ещё раз."
+        )
+        return
+
+    context.user_data["awaiting_email"] = False
+    context.user_data["email"] = email
+
     payment_link = (
         f"{PUBLIC_BASE_URL}/create-payment?"
-        f"email={urllib.parse.quote(user_email)}&currency={DEFAULT_CURRENCY}"
+        f"email={urllib.parse.quote(email)}&currency={DEFAULT_CURRENCY}"
     )
 
     keyboard = [
@@ -227,14 +257,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        "Нажми кнопку ниже, чтобы оформить подписку на доступ к закрытому каналу.",
+        "Отлично. Теперь нажми кнопку ниже, чтобы перейти к оплате.",
         reply_markup=reply_markup,
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Этот бот нужен для автоматического доступа в закрытый канал."
     )
 
 
@@ -243,6 +267,9 @@ async def run_bot() -> None:
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email_message)
+    )
 
     await application.initialize()
     await application.start()
