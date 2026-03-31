@@ -40,6 +40,7 @@ def init_db() -> None:
     conn = get_connection()
     try:
         cur = conn.cursor()
+
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -50,6 +51,18 @@ def init_db() -> None:
             )
             """
         )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payments (
+                id BIGSERIAL PRIMARY KEY,
+                webhook_type TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+
         conn.commit()
         cur.close()
     finally:
@@ -75,6 +88,23 @@ def save_user(update: Update) -> None:
                 first_name = EXCLUDED.first_name
             """,
             (user.id, user.username, user.first_name),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def save_payment_webhook(webhook_type: str, payload: dict) -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO payments (webhook_type, payload)
+            VALUES (%s, %s)
+            """,
+            (webhook_type, json.dumps(payload)),
         )
         conn.commit()
         cur.close()
@@ -166,6 +196,8 @@ async def handle_lava_webhook(
         payload = {"raw_body": raw_text}
 
     logging.info("Lava webhook parsed payload: %s", payload)
+
+    save_payment_webhook(webhook_type, payload)
 
     return {"ok": True, "webhook_type": webhook_type}
 
