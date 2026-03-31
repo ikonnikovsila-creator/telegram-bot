@@ -23,6 +23,10 @@ LAVA_WEBHOOK_API_KEY = os.getenv("LAVA_WEBHOOK_API_KEY")
 if not LAVA_WEBHOOK_API_KEY:
     raise RuntimeError("LAVA_WEBHOOK_API_KEY не найден в переменных окружения")
 
+LAVA_PUBLIC_API_KEY = os.getenv("LAVA_PUBLIC_API_KEY")
+if not LAVA_PUBLIC_API_KEY:
+    raise RuntimeError("LAVA_PUBLIC_API_KEY не найден в переменных окружения")
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL не найден в переменных окружения")
