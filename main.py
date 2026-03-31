@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import urllib.error
+import urllib.request
 from threading import Thread
 from typing import Optional
 
@@ -32,6 +34,15 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL не найден в переменных окружения")
 
 PAYMENT_URL = "https://app.lava.top/products/9866fa87-2097-4635-a760-b4eea6bd54fb/70ca1de2-4073-4ca4-abb8-a964003fe500"
+
+LAVA_INVOICE_API_URL = "https://gate.lava.top/api/v3/invoice"
+LAVA_SUBSCRIPTION_OFFER_ID = "70ca1de2-4073-4ca4-abb8-a964003fe500"
+DEFAULT_CURRENCY = "USD"
+DEFAULT_PAYMENT_PROVIDER = "UNLIMIT"
+DEFAULT_PAYMENT_METHOD = "CARD"
+DEFAULT_PERIODICITY = "MONTHLY"
+
+ALLOWED_CURRENCIES = {"USD", "EUR", "RUB"}
 
 app = FastAPI()
 
@@ -116,6 +127,70 @@ def save_payment_webhook(webhook_type: str, payload: dict) -> None:
         conn.close()
 
 
+def create_lava_invoice(email: str, currency: str = DEFAULT_CURRENCY) -> dict:
+    currency = currency.upper().strip()
+
+    if currency not in ALLOWED_CURRENCIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неподдерживаемая валюта: {currency}",
+        )
+
+    payload = {
+        "email": email,
+        "offerId": LAVA_SUBSCRIPTION_OFFER_ID,
+        "currency": currency,
+        "paymentProvider": DEFAULT_PAYMENT_PROVIDER,
+        "paymentMethod": DEFAULT_PAYMENT_METHOD,
+        "periodicity": DEFAULT_PERIODICITY,
+    }
+
+    req = urllib.request.Request(
+        LAVA_INVOICE_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Api-Key": LAVA_PUBLIC_API_KEY,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+            result = json.loads(raw) if raw else {}
+
+            logging.info("Lava invoice created successfully: %s", result)
+            return result
+
+    except urllib.error.HTTPError as e:
+        raw_error = e.read().decode("utf-8", errors="replace")
+        logging.exception("Lava invoice HTTP error: status=%s body=%s", e.code, raw_error)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Ошибка создания invoice в Lava",
+                "status_code": e.code,
+                "response_body": raw_error,
+            },
+        )
+
+    except urllib.error.URLError as e:
+        logging.exception("Lava invoice URL error: %s", str(e))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Не удалось соединиться с Lava: {str(e)}",
+        )
+
+    except Exception as e:
+        logging.exception("Unexpected Lava invoice error: %s", str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Неожиданная ошибка при создании invoice: {str(e)}",
+        )
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_user(update)
 
@@ -171,6 +246,11 @@ def startup_event() -> None:
 @app.get("/")
 def root() -> dict:
     return {"status": "ok", "message": "Telegram bot is running"}
+
+
+@app.get("/create-payment")
+def create_payment(email: str, currency: str = DEFAULT_CURRENCY) -> dict:
+    return create_lava_invoice(email=email, currency=currency)
 
 
 async def handle_lava_webhook(
