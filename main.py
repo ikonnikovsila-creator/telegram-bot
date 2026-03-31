@@ -2,10 +2,10 @@ import asyncio
 import json
 import logging
 import os
-
 from threading import Thread
 from typing import Optional
 
+import psycopg2
 from fastapi import FastAPI, Header, HTTPException, Request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -23,15 +23,73 @@ LAVA_WEBHOOK_API_KEY = os.getenv("LAVA_WEBHOOK_API_KEY")
 if not LAVA_WEBHOOK_API_KEY:
     raise RuntimeError("LAVA_WEBHOOK_API_KEY не найден в переменных окружения")
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL не найден в переменных окружения")
+
+PAYMENT_URL = "https://app.lava.top/products/9866fa87-2097-4635-a760-b4eea6bd54fb/70ca1de2-4073-4ca4-abb8-a964003fe500"
+
 app = FastAPI()
 
 
+def get_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db() -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def save_user(update: Update) -> None:
+    if not update.effective_user:
+        return
+
+    user = update.effective_user
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO users (telegram_user_id, username, first_name)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (telegram_user_id)
+            DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name
+            """,
+            (user.id, user.username, user.first_name),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user(update)
+
     keyboard = [
         [
             InlineKeyboardButton(
                 "Оплатить доступ",
-                url="https://app.lava.top/products/9866fa87-2097-4635-a760-b4eea6bd54fb/70ca1de2-4073-4ca4-abb8-a964003fe500",
+                url=PAYMENT_URL,
             )
         ]
     ]
@@ -71,6 +129,7 @@ def start_bot_in_background() -> None:
 
 @app.on_event("startup")
 def startup_event() -> None:
+    init_db()
     thread = Thread(target=start_bot_in_background, daemon=True)
     thread.start()
 
