@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 import psycopg2
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -46,6 +46,9 @@ PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
     "https://zooming-acceptance-production-b914.up.railway.app",
 )
+
+TELEGRAM_BOT_USERNAME = "tochka_opory_access_bot"
+TELEGRAM_BOT_URL = f"https://t.me/{TELEGRAM_BOT_USERNAME}"
 
 LAVA_INVOICE_API_URL = "https://gate.lava.top/api/v3/invoice"
 LAVA_SUBSCRIPTION_OFFER_ID = "70ca1de2-4073-4ca4-abb8-a964003fe500"
@@ -525,6 +528,83 @@ def startup_event() -> None:
 @app.get("/")
 def root() -> dict:
     return {"status": "ok", "message": "Telegram bot is running"}
+
+
+@app.get("/success", response_class=HTMLResponse)
+def success_page() -> str:
+    return f"""
+    <!doctype html>
+    <html lang="ru">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Оплата получена</title>
+        <style>
+            body {{
+                margin: 0;
+                padding: 0;
+                background: #0f0f10;
+                color: #f5f5f5;
+                font-family: Arial, sans-serif;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+            }}
+            .card {{
+                width: 100%;
+                max-width: 520px;
+                padding: 32px 24px;
+                border-radius: 20px;
+                background: #18181b;
+                box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+                text-align: center;
+                box-sizing: border-box;
+            }}
+            h1 {{
+                margin: 0 0 16px;
+                font-size: 28px;
+            }}
+            p {{
+                margin: 0 0 14px;
+                color: #d1d5db;
+                line-height: 1.5;
+                font-size: 16px;
+            }}
+            .btn {{
+                display: inline-block;
+                margin-top: 18px;
+                padding: 14px 22px;
+                border-radius: 12px;
+                background: #ffffff;
+                color: #111111;
+                text-decoration: none;
+                font-weight: 700;
+                font-size: 16px;
+            }}
+            .note {{
+                margin-top: 16px;
+                font-size: 14px;
+                color: #a1a1aa;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>Оплата почти завершена.</h1>
+            <p>Если платёж уже прошёл, вернись в Telegram.</p>
+            <p>Дальше бот продолжит путь и даст тебе следующий шаг.</p>
+            <a class="btn" href="{TELEGRAM_BOT_URL}">Открыть Telegram</a>
+            <div class="note">Если Telegram не открылся автоматически, нажми кнопку ещё раз.</div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.get("/open-bot")
+def open_bot():
+    return RedirectResponse(url=TELEGRAM_BOT_URL, status_code=302)
 
 
 @app.get("/create-payment")
