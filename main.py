@@ -7,7 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from threading import Thread
-from typing import Optional
+from typing import Any, Optional
 
 import psycopg2
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -42,11 +42,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL не найден в переменных окружения")
 
-PUBLIC_BASE_URL = "https://zooming-acceptance-production-b914.up.railway.app"
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "https://zooming-acceptance-production-b914.up.railway.app",
+)
 
 LAVA_INVOICE_API_URL = "https://gate.lava.top/api/v3/invoice"
 LAVA_SUBSCRIPTION_OFFER_ID = "70ca1de2-4073-4ca4-abb8-a964003fe500"
-DEFAULT_CURRENCY = "USD"
 DEFAULT_PAYMENT_PROVIDER = "UNLIMIT"
 DEFAULT_PAYMENT_METHOD = "CARD"
 DEFAULT_PERIODICITY = "MONTHLY"
@@ -78,11 +80,43 @@ def init_db() -> None:
 
         cur.execute(
             """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS email TEXT
+            """
+        )
+
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS payments (
                 id BIGSERIAL PRIMARY KEY,
                 webhook_type TEXT NOT NULL,
                 payload JSONB NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE payments
+            ADD COLUMN IF NOT EXISTS lava_invoice_id TEXT
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invoices (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_user_id BIGINT,
+                email TEXT,
+                currency TEXT,
+                lava_invoice_id TEXT UNIQUE NOT NULL,
+                payment_url TEXT,
+                status TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                last_webhook_type TEXT,
+                last_webhook_payload JSONB
             )
             """
         )
@@ -119,16 +153,125 @@ def save_user(update: Update) -> None:
         conn.close()
 
 
-def save_payment_webhook(webhook_type: str, payload: dict) -> None:
+def save_user_email(telegram_user_id: int, email: str) -> None:
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO payments (webhook_type, payload)
-            VALUES (%s, %s)
+            UPDATE users
+            SET email = %s
+            WHERE telegram_user_id = %s
             """,
-            (webhook_type, json.dumps(payload)),
+            (email, telegram_user_id),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def save_payment_webhook(
+    webhook_type: str,
+    payload: dict,
+    lava_invoice_id: Optional[str],
+) -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO payments (webhook_type, payload, lava_invoice_id)
+            VALUES (%s, %s, %s)
+            """,
+            (webhook_type, json.dumps(payload), lava_invoice_id),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def save_invoice_record(
+    telegram_user_id: int,
+    email: str,
+    currency: str,
+    lava_invoice_id: str,
+    payment_url: str,
+    status: str,
+) -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO invoices (
+                telegram_user_id,
+                email,
+                currency,
+                lava_invoice_id,
+                payment_url,
+                status
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (lava_invoice_id)
+            DO UPDATE SET
+                telegram_user_id = EXCLUDED.telegram_user_id,
+                email = EXCLUDED.email,
+                currency = EXCLUDED.currency,
+                payment_url = EXCLUDED.payment_url,
+                status = EXCLUDED.status,
+                updated_at = NOW()
+            """,
+            (
+                telegram_user_id,
+                email,
+                currency,
+                lava_invoice_id,
+                payment_url,
+                status,
+            ),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def update_invoice_from_webhook(
+    lava_invoice_id: Optional[str],
+    webhook_type: str,
+    payload: dict,
+    status: Optional[str],
+) -> None:
+    if not lava_invoice_id:
+        return
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO invoices (
+                lava_invoice_id,
+                status,
+                last_webhook_type,
+                last_webhook_payload
+            )
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (lava_invoice_id)
+            DO UPDATE SET
+                status = COALESCE(EXCLUDED.status, invoices.status),
+                last_webhook_type = EXCLUDED.last_webhook_type,
+                last_webhook_payload = EXCLUDED.last_webhook_payload,
+                updated_at = NOW()
+            """,
+            (
+                lava_invoice_id,
+                status,
+                webhook_type,
+                json.dumps(payload),
+            ),
         )
         conn.commit()
         cur.close()
@@ -142,7 +285,101 @@ def is_valid_email(email: str) -> bool:
     return bool(re.fullmatch(pattern, email))
 
 
-def create_lava_invoice(email: str, currency: str = DEFAULT_CURRENCY) -> dict:
+def build_payment_link(telegram_user_id: int, email: str, currency: str) -> str:
+    query = urllib.parse.urlencode(
+        {
+            "tg_user_id": telegram_user_id,
+            "email": email,
+            "currency": currency,
+        }
+    )
+    return f"{PUBLIC_BASE_URL}/create-payment?{query}"
+
+
+def create_payment_keyboard(telegram_user_id: int, email: str) -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "Оплатить в USD",
+                url=build_payment_link(telegram_user_id, email, "USD"),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "Оплатить в EUR",
+                url=build_payment_link(telegram_user_id, email, "EUR"),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "Оплатить в RUB",
+                url=build_payment_link(telegram_user_id, email, "RUB"),
+            )
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def find_first_value(data: Any, target_keys: set[str]) -> Optional[Any]:
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in target_keys:
+                return value
+        for value in data.values():
+            found = find_first_value(value, target_keys)
+            if found is not None:
+                return found
+
+    if isinstance(data, list):
+        for item in data:
+            found = find_first_value(item, target_keys)
+            if found is not None:
+                return found
+
+    return None
+
+
+def extract_lava_invoice_id(payload: dict) -> Optional[str]:
+    direct = find_first_value(
+        payload,
+        {
+            "invoiceId",
+            "invoice_id",
+            "invoiceID",
+            "receiptInvoice",
+            "receipt_invoice",
+        },
+    )
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    payment_settings = find_first_value(payload, {"paymentSettings", "payment_settings"})
+    if isinstance(payment_settings, dict):
+        invoice_type = payment_settings.get("type")
+        invoice_id = payment_settings.get("id")
+        if invoice_type == "invoice" and isinstance(invoice_id, str) and invoice_id.strip():
+            return invoice_id.strip()
+
+    return None
+
+
+def extract_status(payload: dict) -> Optional[str]:
+    status = find_first_value(
+        payload,
+        {
+            "status",
+            "paymentStatus",
+            "payment_status",
+            "invoiceStatus",
+            "invoice_status",
+        },
+    )
+    if status is None:
+        return None
+    return str(status)
+
+
+def create_lava_invoice(email: str, currency: str) -> dict:
     currency = currency.upper().strip()
 
     if currency not in ALLOWED_CURRENCIES:
@@ -175,13 +412,16 @@ def create_lava_invoice(email: str, currency: str = DEFAULT_CURRENCY) -> dict:
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             result = json.loads(raw) if raw else {}
-
             logging.info("Lava invoice created successfully: %s", result)
             return result
 
     except urllib.error.HTTPError as e:
         raw_error = e.read().decode("utf-8", errors="replace")
-        logging.exception("Lava invoice HTTP error: status=%s body=%s", e.code, raw_error)
+        logging.exception(
+            "Lava invoice HTTP error: status=%s body=%s",
+            e.code,
+            raw_error,
+        )
         raise HTTPException(
             status_code=502,
             detail={
@@ -208,19 +448,18 @@ def create_lava_invoice(email: str, currency: str = DEFAULT_CURRENCY) -> dict:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_user(update)
-
     context.user_data["awaiting_email"] = True
 
     if update.message:
         await update.message.reply_text(
-            "Отправь свой email для оформления оплаты. После этого я пришлю кнопку оплаты."
+            "Отправь свой email для оформления оплаты. После этого я пришлю кнопки оплаты в USD, EUR и RUB."
         )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(
-            "Нажми /start, отправь email и получи кнопку оплаты."
+            "Нажми /start, отправь email и выбери валюту оплаты."
         )
 
 
@@ -239,26 +478,16 @@ async def handle_email_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    save_user(update)
+    save_user_email(update.effective_user.id, email)
+
     context.user_data["awaiting_email"] = False
     context.user_data["email"] = email
 
-    payment_link = (
-        f"{PUBLIC_BASE_URL}/create-payment?"
-        f"email={urllib.parse.quote(email)}&currency={DEFAULT_CURRENCY}"
-    )
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "Оплатить доступ",
-                url=payment_link,
-            )
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = create_payment_keyboard(update.effective_user.id, email)
 
     await update.message.reply_text(
-        "Отлично. Теперь нажми кнопку ниже, чтобы перейти к оплате.",
+        "Отлично. Теперь выбери валюту и перейди к оплате.",
         reply_markup=reply_markup,
     )
 
@@ -299,15 +528,36 @@ def root() -> dict:
 
 
 @app.get("/create-payment")
-def create_payment(email: str, currency: str = DEFAULT_CURRENCY):
+def create_payment(tg_user_id: int, email: str, currency: str):
+    if not is_valid_email(email):
+        raise HTTPException(status_code=400, detail="Некорректный email")
+
     result = create_lava_invoice(email=email, currency=currency)
 
+    lava_invoice_id = result.get("id")
     payment_url = result.get("paymentUrl")
+    status = result.get("status", "new")
+
+    if not lava_invoice_id:
+        raise HTTPException(
+            status_code=502,
+            detail="Lava не вернула id invoice",
+        )
+
     if not payment_url:
         raise HTTPException(
             status_code=502,
             detail="Lava не вернула paymentUrl",
         )
+
+    save_invoice_record(
+        telegram_user_id=tg_user_id,
+        email=email,
+        currency=currency.upper(),
+        lava_invoice_id=lava_invoice_id,
+        payment_url=payment_url,
+        status=status,
+    )
 
     return RedirectResponse(url=payment_url, status_code=302)
 
@@ -338,11 +588,21 @@ async def handle_lava_webhook(
     except json.JSONDecodeError:
         payload = {"raw_body": raw_text}
 
+    lava_invoice_id = extract_lava_invoice_id(payload)
+    status = extract_status(payload)
+
     logging.info("Lava webhook parsed payload: %s", payload)
+    logging.info("Lava webhook extracted invoice_id=%s status=%s", lava_invoice_id, status)
 
-    save_payment_webhook(webhook_type, payload)
+    save_payment_webhook(webhook_type, payload, lava_invoice_id)
+    update_invoice_from_webhook(lava_invoice_id, webhook_type, payload, status)
 
-    return {"ok": True, "webhook_type": webhook_type}
+    return {
+        "ok": True,
+        "webhook_type": webhook_type,
+        "lava_invoice_id": lava_invoice_id,
+        "status": status,
+    }
 
 
 @app.post("/webhooks/lava/payment")
