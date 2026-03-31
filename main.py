@@ -11,6 +11,7 @@ from typing import Optional
 
 import psycopg2
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import RedirectResponse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -298,8 +299,17 @@ def root() -> dict:
 
 
 @app.get("/create-payment")
-def create_payment(email: str, currency: str = DEFAULT_CURRENCY) -> dict:
-    return create_lava_invoice(email=email, currency=currency)
+def create_payment(email: str, currency: str = DEFAULT_CURRENCY):
+    result = create_lava_invoice(email=email, currency=currency)
+
+    payment_url = result.get("paymentUrl")
+    if not payment_url:
+        raise HTTPException(
+            status_code=502,
+            detail="Lava не вернула paymentUrl",
+        )
+
+    return RedirectResponse(url=payment_url, status_code=302)
 
 
 async def handle_lava_webhook(
