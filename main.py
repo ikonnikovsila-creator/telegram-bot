@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from threading import Thread
 from typing import Optional
@@ -33,7 +34,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL не найден в переменных окружения")
 
-PAYMENT_URL = "https://app.lava.top/products/9866fa87-2097-4635-a760-b4eea6bd54fb/70ca1de2-4073-4ca4-abb8-a964003fe500"
+PUBLIC_BASE_URL = "https://zooming-acceptance-production-b914.up.railway.app"
 
 LAVA_INVOICE_API_URL = "https://gate.lava.top/api/v3/invoice"
 LAVA_SUBSCRIPTION_OFFER_ID = "70ca1de2-4073-4ca4-abb8-a964003fe500"
@@ -127,6 +128,21 @@ def save_payment_webhook(webhook_type: str, payload: dict) -> None:
         conn.close()
 
 
+def build_user_email(update: Update) -> str:
+    user = update.effective_user
+    if not user:
+        raise ValueError("Не удалось определить пользователя Telegram")
+
+    if user.username:
+        safe_username = "".join(
+            ch for ch in user.username.lower() if ch.isalnum() or ch in {"_", ".", "-"}
+        )
+        if safe_username:
+            return f"{safe_username}@telegram.local"
+
+    return f"telegram_{user.id}@telegram.local"
+
+
 def create_lava_invoice(email: str, currency: str = DEFAULT_CURRENCY) -> dict:
     currency = currency.upper().strip()
 
@@ -194,11 +210,17 @@ def create_lava_invoice(email: str, currency: str = DEFAULT_CURRENCY) -> dict:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_user(update)
 
+    user_email = build_user_email(update)
+    payment_link = (
+        f"{PUBLIC_BASE_URL}/create-payment?"
+        f"email={urllib.parse.quote(user_email)}&currency={DEFAULT_CURRENCY}"
+    )
+
     keyboard = [
         [
             InlineKeyboardButton(
                 "Оплатить доступ",
-                url=PAYMENT_URL,
+                url=payment_link,
             )
         ]
     ]
