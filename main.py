@@ -47,6 +47,10 @@ PUBLIC_BASE_URL = os.getenv(
     "https://zooming-acceptance-production-b914.up.railway.app",
 )
 
+PRIVATE_CHANNEL_CHAT_ID = os.getenv("PRIVATE_CHANNEL_CHAT_ID")
+if not PRIVATE_CHANNEL_CHAT_ID:
+    raise RuntimeError("PRIVATE_CHANNEL_CHAT_ID не найден в переменных окружения")
+
 TELEGRAM_BOT_USERNAME = "tochka_opory_access_bot"
 TELEGRAM_BOT_URL = f"https://t.me/{TELEGRAM_BOT_USERNAME}"
 
@@ -93,15 +97,9 @@ def init_db() -> None:
                 id BIGSERIAL PRIMARY KEY,
                 webhook_type TEXT NOT NULL,
                 payload JSONB NOT NULL,
+                lava_invoice_id TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             )
-            """
-        )
-
-        cur.execute(
-            """
-            ALTER TABLE payments
-            ADD COLUMN IF NOT EXISTS lava_invoice_id TEXT
             """
         )
 
@@ -117,6 +115,7 @@ def init_db() -> None:
                 lava_invoice_id TEXT UNIQUE NOT NULL,
                 payment_url TEXT,
                 status TEXT,
+                access_invite_sent_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW(),
                 last_webhook_type TEXT,
@@ -136,6 +135,13 @@ def init_db() -> None:
             """
             ALTER TABLE invoices
             ADD COLUMN IF NOT EXISTS payment_route_label TEXT
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS access_invite_sent_at TIMESTAMP
             """
         )
 
@@ -305,6 +311,67 @@ def update_invoice_from_webhook(
         conn.close()
 
 
+def get_invoice_owner(lava_invoice_id: str) -> Optional[int]:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT telegram_user_id
+            FROM invoices
+            WHERE lava_invoice_id = %s
+            LIMIT 1
+            """,
+            (lava_invoice_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        return row[0]
+    finally:
+        conn.close()
+
+
+def was_access_invite_sent(lava_invoice_id: str) -> bool:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT access_invite_sent_at
+            FROM invoices
+            WHERE lava_invoice_id = %s
+            LIMIT 1
+            """,
+            (lava_invoice_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return bool(row and row[0] is not None)
+    finally:
+        conn.close()
+
+
+def mark_access_invite_sent(lava_invoice_id: str) -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE invoices
+            SET access_invite_sent_at = NOW(),
+                updated_at = NOW()
+            WHERE lava_invoice_id = %s
+            """,
+            (lava_invoice_id,),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
 def is_valid_email(email: str) -> bool:
     email = email.strip()
     pattern = r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"
@@ -459,13 +526,6 @@ def extract_status(payload: dict) -> Optional[str]:
 
 
 def build_invoice_payload(email: str, currency: str, payment_route: str) -> dict:
-    """
-    Важно:
-    - route сохраняем как пользовательское предпочтение и для аналитики.
-    - Финальный способ оплаты всё равно может выбирать checkout Lava.
-    - Для USD/EUR НЕ хардкодим paymentMethod='CARD', чтобы не зажимать checkout
-      только в карту и не отрезать PayPal/другие доступные методы на стороне Lava.
-    """
     currency = normalize_currency(currency)
     payment_route = normalize_payment_route(payment_route)
 
@@ -552,6 +612,103 @@ def create_lava_invoice(email: str, currency: str, payment_route: str) -> dict:
         )
 
 
+def is_success_status(status: Optional[str]) -> bool:
+    if not status:
+        return False
+
+    normalized = str(status).strip().lower()
+    return normalized in {
+        "success",
+        "succeeded",
+        "paid",
+        "completed",
+        "active",
+        "finished",
+    }
+
+
+def send_telegram_api_request(method: str, payload: dict) -> dict:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as response:
+        raw = response.read().decode("utf-8")
+        result = json.loads(raw) if raw else {}
+
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram API error in {method}: {result}")
+
+    return result
+
+
+def send_telegram_text(chat_id: int, text: str) -> None:
+    send_telegram_api_request(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+        },
+    )
+
+
+def create_single_use_invite_link() -> str:
+    result = send_telegram_api_request(
+        "createChatInviteLink",
+        {
+            "chat_id": int(PRIVATE_CHANNEL_CHAT_ID),
+            "member_limit": 1,
+            "name": "paid-access",
+        },
+    )
+    return result["result"]["invite_link"]
+
+
+def send_access_invite_if_paid(lava_invoice_id: Optional[str], status: Optional[str]) -> None:
+    if not lava_invoice_id:
+        return
+
+    if not is_success_status(status):
+        logging.info("Webhook status is not successful yet: %s", status)
+        return
+
+    if was_access_invite_sent(lava_invoice_id):
+        logging.info("Access invite already sent for invoice: %s", lava_invoice_id)
+        return
+
+    telegram_user_id = get_invoice_owner(lava_invoice_id)
+    if not telegram_user_id:
+        logging.warning("Invoice owner not found for lava_invoice_id=%s", lava_invoice_id)
+        return
+
+    invite_link = create_single_use_invite_link()
+
+    send_telegram_text(
+        telegram_user_id,
+        "Оплата подтверждена.\n\n"
+        "Вот твоя персональная ссылка для входа в закрытый канал:\n"
+        f"{invite_link}\n\n"
+        "Ссылка рассчитана на один вход.",
+    )
+
+    mark_access_invite_sent(lava_invoice_id)
+
+    logging.info(
+        "Access invite sent: lava_invoice_id=%s telegram_user_id=%s",
+        lava_invoice_id,
+        telegram_user_id,
+    )
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_user(update)
     context.user_data["awaiting_email"] = True
@@ -609,20 +766,11 @@ async def handle_email_message(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.channel_post:
-        return
-
-    chat = update.channel_post.chat
-    logging.info("PRIVATE_CHANNEL_CHAT_ID=%s title=%s", chat.id, chat.title)
-
-
 async def run_bot() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email_message)
     )
@@ -717,7 +865,7 @@ def success_page() -> str:
             <h1>Оплата почти завершена.</h1>
             <p>Если платёж уже прошёл, вернись в Telegram.</p>
             <p>Если страница Lava предложила несколько способов оплаты, выбери тот, который удобен тебе.</p>
-            <p>После подтверждения оплаты бот продолжит путь и даст следующий шаг.</p>
+            <p>После подтверждения оплаты бот пришлёт персональную ссылку в закрытый канал.</p>
             <a class="btn" href="{TELEGRAM_BOT_URL}">Открыть Telegram</a>
             <div class="note">Если Telegram не открылся автоматически, нажми кнопку ещё раз.</div>
         </div>
@@ -818,6 +966,7 @@ async def handle_lava_webhook(
 
     save_payment_webhook(webhook_type, payload, lava_invoice_id)
     update_invoice_from_webhook(lava_invoice_id, webhook_type, payload, status)
+    send_access_invite_if_paid(lava_invoice_id, status)
 
     return {
         "ok": True,
