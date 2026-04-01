@@ -51,8 +51,13 @@ PRIVATE_CHANNEL_CHAT_ID = os.getenv("PRIVATE_CHANNEL_CHAT_ID")
 if not PRIVATE_CHANNEL_CHAT_ID:
     raise RuntimeError("PRIVATE_CHANNEL_CHAT_ID не найден в переменных окружения")
 
+PUBLIC_CHANNEL_CHAT_ID = os.getenv("PUBLIC_CHANNEL_CHAT_ID")
+if not PUBLIC_CHANNEL_CHAT_ID:
+    raise RuntimeError("PUBLIC_CHANNEL_CHAT_ID не найден в переменных окружения")
+
 TELEGRAM_BOT_USERNAME = "tochka_opory_access_bot"
 TELEGRAM_BOT_URL = f"https://t.me/{TELEGRAM_BOT_USERNAME}"
+TELEGRAM_BOT_START_FROM_VITRINA_URL = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=from_vitrina"
 
 LAVA_INVOICE_API_URL = "https://gate.lava.top/api/v3/invoice"
 LAVA_SUBSCRIPTION_OFFER_ID = "70ca1de2-4073-4ca4-abb8-a964003fe500"
@@ -60,6 +65,14 @@ DEFAULT_PERIODICITY = "MONTHLY"
 
 ALLOWED_CURRENCIES = {"USD", "EUR", "RUB"}
 ALLOWED_PAYMENT_ROUTES = {"CARD", "PAYPAL", "SBP"}
+
+PUBLIC_ENTRY_POST_TEXT = (
+    "Здесь не утешают, здесь проясняют.\n\n"
+    "Закрытый канал с доступом по подписке.\n"
+    "Внутри - тексты и разборы о тревоге, внимании, мыслях, отношениях и внутренней собранности.\n\n"
+    "Нажми на кнопку ниже.\n"
+    "Дальше бот сам проведёт тебя по шагам."
+)
 
 app = FastAPI()
 
@@ -661,6 +674,26 @@ def send_telegram_text(chat_id: int, text: str) -> None:
     )
 
 
+def send_public_entry_post() -> dict:
+    return send_telegram_api_request(
+        "sendMessage",
+        {
+            "chat_id": int(PUBLIC_CHANNEL_CHAT_ID),
+            "text": PUBLIC_ENTRY_POST_TEXT,
+            "reply_markup": {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Оформить доступ",
+                            "url": TELEGRAM_BOT_START_FROM_VITRINA_URL,
+                        }
+                    ]
+                ]
+            },
+        },
+    )
+
+
 def create_single_use_invite_link() -> str:
     result = send_telegram_api_request(
         "createChatInviteLink",
@@ -766,20 +799,11 @@ async def handle_email_message(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.channel_post:
-        return
-
-    chat = update.channel_post.chat
-    logging.info("CHANNEL_POST_CHAT_ID=%s title=%s", chat.id, chat.title)
-
-
 async def run_bot() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email_message)
     )
@@ -886,6 +910,16 @@ def success_page() -> str:
 @app.get("/open-bot")
 def open_bot():
     return RedirectResponse(url=TELEGRAM_BOT_URL, status_code=302)
+
+
+@app.get("/publish-public-entry-post")
+def publish_public_entry_post():
+    result = send_public_entry_post()
+    return {
+        "ok": True,
+        "chat_id": PUBLIC_CHANNEL_CHAT_ID,
+        "message_id": result["result"]["message_id"],
+    }
 
 
 @app.get("/create-payment")
