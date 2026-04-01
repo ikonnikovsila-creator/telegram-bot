@@ -55,6 +55,7 @@ LAVA_SUBSCRIPTION_OFFER_ID = "70ca1de2-4073-4ca4-abb8-a964003fe500"
 DEFAULT_PERIODICITY = "MONTHLY"
 
 ALLOWED_CURRENCIES = {"USD", "EUR", "RUB"}
+ALLOWED_PAYMENT_ROUTES = {"CARD", "PAYPAL", "SBP"}
 
 app = FastAPI()
 
@@ -111,6 +112,8 @@ def init_db() -> None:
                 telegram_user_id BIGINT,
                 email TEXT,
                 currency TEXT,
+                payment_route TEXT,
+                payment_route_label TEXT,
                 lava_invoice_id TEXT UNIQUE NOT NULL,
                 payment_url TEXT,
                 status TEXT,
@@ -119,6 +122,20 @@ def init_db() -> None:
                 last_webhook_type TEXT,
                 last_webhook_payload JSONB
             )
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS payment_route TEXT
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS payment_route_label TEXT
             """
         )
 
@@ -197,6 +214,8 @@ def save_invoice_record(
     telegram_user_id: int,
     email: str,
     currency: str,
+    payment_route: str,
+    payment_route_label: str,
     lava_invoice_id: str,
     payment_url: str,
     status: str,
@@ -210,16 +229,20 @@ def save_invoice_record(
                 telegram_user_id,
                 email,
                 currency,
+                payment_route,
+                payment_route_label,
                 lava_invoice_id,
                 payment_url,
                 status
             )
-            VALUES (%s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (lava_invoice_id)
             DO UPDATE SET
                 telegram_user_id = EXCLUDED.telegram_user_id,
                 email = EXCLUDED.email,
                 currency = EXCLUDED.currency,
+                payment_route = EXCLUDED.payment_route,
+                payment_route_label = EXCLUDED.payment_route_label,
                 payment_url = EXCLUDED.payment_url,
                 status = EXCLUDED.status,
                 updated_at = NOW()
@@ -228,6 +251,8 @@ def save_invoice_record(
                 telegram_user_id,
                 email,
                 currency,
+                payment_route,
+                payment_route_label,
                 lava_invoice_id,
                 payment_url,
                 status,
@@ -286,12 +311,53 @@ def is_valid_email(email: str) -> bool:
     return bool(re.fullmatch(pattern, email))
 
 
-def build_payment_link(telegram_user_id: int, email: str, currency: str) -> str:
+def normalize_currency(currency: str) -> str:
+    normalized = currency.upper().strip()
+    if normalized not in ALLOWED_CURRENCIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неподдерживаемая валюта: {currency}",
+        )
+    return normalized
+
+
+def normalize_payment_route(payment_route: Optional[str]) -> str:
+    route = (payment_route or "CARD").upper().strip()
+    if route not in ALLOWED_PAYMENT_ROUTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неподдерживаемый маршрут оплаты: {payment_route}",
+        )
+    return route
+
+
+def get_payment_route_label(currency: str, payment_route: str) -> str:
+    currency = normalize_currency(currency)
+    payment_route = normalize_payment_route(payment_route)
+
+    if payment_route == "SBP":
+        return "СБП"
+    if payment_route == "PAYPAL":
+        return "PayPal"
+    if currency == "RUB":
+        return "RUB / карта"
+    if currency == "EUR":
+        return "EUR / карта"
+    return "USD / карта"
+
+
+def build_payment_link(
+    telegram_user_id: int,
+    email: str,
+    currency: str,
+    payment_route: str,
+) -> str:
     query = urllib.parse.urlencode(
         {
             "tg_user_id": telegram_user_id,
             "email": email,
             "currency": currency,
+            "route": payment_route,
         }
     )
     return f"{PUBLIC_BASE_URL}/create-payment?{query}"
@@ -301,20 +367,32 @@ def create_payment_keyboard(telegram_user_id: int, email: str) -> InlineKeyboard
     keyboard = [
         [
             InlineKeyboardButton(
+                "Оплатить в RUB",
+                url=build_payment_link(telegram_user_id, email, "RUB", "CARD"),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "Оплатить через СБП",
+                url=build_payment_link(telegram_user_id, email, "RUB", "SBP"),
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 "Оплатить в USD",
-                url=build_payment_link(telegram_user_id, email, "USD"),
+                url=build_payment_link(telegram_user_id, email, "USD", "CARD"),
             )
         ],
         [
             InlineKeyboardButton(
                 "Оплатить в EUR",
-                url=build_payment_link(telegram_user_id, email, "EUR"),
+                url=build_payment_link(telegram_user_id, email, "EUR", "CARD"),
             )
         ],
         [
             InlineKeyboardButton(
-                "Оплатить в RUB",
-                url=build_payment_link(telegram_user_id, email, "RUB"),
+                "Оплатить через PayPal",
+                url=build_payment_link(telegram_user_id, email, "USD", "PAYPAL"),
             )
         ],
     ]
@@ -380,13 +458,27 @@ def extract_status(payload: dict) -> Optional[str]:
     return str(status)
 
 
-def build_invoice_payload(email: str, currency: str) -> dict:
-    currency = currency.upper().strip()
+def build_invoice_payload(email: str, currency: str, payment_route: str) -> dict:
+    """
+    Важно:
+    - route сохраняем как пользовательское предпочтение и для аналитики.
+    - Финальный способ оплаты всё равно может выбирать checkout Lava.
+    - Для USD/EUR НЕ хардкодим paymentMethod='CARD', чтобы не зажимать checkout
+      только в карту и не отрезать PayPal/другие доступные методы на стороне Lava.
+    """
+    currency = normalize_currency(currency)
+    payment_route = normalize_payment_route(payment_route)
 
-    if currency not in ALLOWED_CURRENCIES:
+    if currency == "RUB" and payment_route == "PAYPAL":
         raise HTTPException(
             status_code=400,
-            detail=f"Неподдерживаемая валюта: {currency}",
+            detail="PayPal недоступен для RUB-маршрута",
+        )
+
+    if currency in {"USD", "EUR"} and payment_route == "SBP":
+        raise HTTPException(
+            status_code=400,
+            detail="СБП доступен только для RUB-маршрута",
         )
 
     payload = {
@@ -400,13 +492,16 @@ def build_invoice_payload(email: str, currency: str) -> dict:
         payload["paymentProvider"] = "SMART_GLOCAL"
     else:
         payload["paymentProvider"] = "UNLIMIT"
-        payload["paymentMethod"] = "CARD"
 
     return payload
 
 
-def create_lava_invoice(email: str, currency: str) -> dict:
-    payload = build_invoice_payload(email=email, currency=currency)
+def create_lava_invoice(email: str, currency: str, payment_route: str) -> dict:
+    payload = build_invoice_payload(
+        email=email,
+        currency=currency,
+        payment_route=payment_route,
+    )
 
     req = urllib.request.Request(
         LAVA_INVOICE_API_URL,
@@ -463,14 +558,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if update.message:
         await update.message.reply_text(
-            "Отправь свой email для оформления оплаты. После этого я пришлю кнопки оплаты в USD, EUR и RUB."
+            "Отправь свой email для оформления оплаты.\n\n"
+            "После этого я пришлю кнопки оплаты:\n"
+            "- RUB\n"
+            "- СБП\n"
+            "- USD\n"
+            "- EUR\n"
+            "- PayPal"
         )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(
-            "Нажми /start, отправь email и выбери валюту оплаты."
+            "Нажми /start, отправь email и выбери удобный способ оплаты."
         )
 
 
@@ -498,7 +599,12 @@ async def handle_email_message(update: Update, context: ContextTypes.DEFAULT_TYP
     reply_markup = create_payment_keyboard(update.effective_user.id, email)
 
     await update.message.reply_text(
-        "Отлично. Теперь выбери валюту и перейди к оплате.",
+        "Отлично. Теперь выбери способ оплаты.\n\n"
+        "Подсказка:\n"
+        "- RUB или СБП - для РФ\n"
+        "- USD / EUR - для зарубежных карт\n"
+        "- PayPal - для тех, у кого удобнее этот маршрут\n\n"
+        "Если один вариант не проходит, попробуй другой.",
         reply_markup=reply_markup,
     )
 
@@ -561,7 +667,7 @@ def success_page() -> str:
             }}
             .card {{
                 width: 100%;
-                max-width: 520px;
+                max-width: 560px;
                 padding: 32px 24px;
                 border-radius: 20px;
                 background: #18181b;
@@ -601,7 +707,8 @@ def success_page() -> str:
         <div class="card">
             <h1>Оплата почти завершена.</h1>
             <p>Если платёж уже прошёл, вернись в Telegram.</p>
-            <p>Дальше бот продолжит путь и даст тебе следующий шаг.</p>
+            <p>Если страница Lava предложила несколько способов оплаты, выбери тот, который удобен тебе.</p>
+            <p>После подтверждения оплаты бот продолжит путь и даст следующий шаг.</p>
             <a class="btn" href="{TELEGRAM_BOT_URL}">Открыть Telegram</a>
             <div class="note">Если Telegram не открылся автоматически, нажми кнопку ещё раз.</div>
         </div>
@@ -616,11 +723,27 @@ def open_bot():
 
 
 @app.get("/create-payment")
-def create_payment(tg_user_id: int, email: str, currency: str):
+def create_payment(
+    tg_user_id: int,
+    email: str,
+    currency: str,
+    route: Optional[str] = "CARD",
+):
     if not is_valid_email(email):
         raise HTTPException(status_code=400, detail="Некорректный email")
 
-    result = create_lava_invoice(email=email, currency=currency)
+    normalized_currency = normalize_currency(currency)
+    normalized_route = normalize_payment_route(route)
+    payment_route_label = get_payment_route_label(
+        normalized_currency,
+        normalized_route,
+    )
+
+    result = create_lava_invoice(
+        email=email,
+        currency=normalized_currency,
+        payment_route=normalized_route,
+    )
 
     lava_invoice_id = result.get("id")
     payment_url = result.get("paymentUrl")
@@ -641,7 +764,9 @@ def create_payment(tg_user_id: int, email: str, currency: str):
     save_invoice_record(
         telegram_user_id=tg_user_id,
         email=email,
-        currency=currency.upper(),
+        currency=normalized_currency,
+        payment_route=normalized_route,
+        payment_route_label=payment_route_label,
         lava_invoice_id=lava_invoice_id,
         payment_url=payment_url,
         status=status,
