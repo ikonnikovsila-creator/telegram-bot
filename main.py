@@ -766,11 +766,20 @@ async def handle_email_message(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.channel_post:
+        return
+
+    chat = update.channel_post.chat
+    logging.info("CHANNEL_POST_CHAT_ID=%s title=%s", chat.id, chat.title)
+
+
 async def run_bot() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email_message)
     )
