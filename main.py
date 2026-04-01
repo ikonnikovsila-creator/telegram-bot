@@ -52,8 +52,6 @@ TELEGRAM_BOT_URL = f"https://t.me/{TELEGRAM_BOT_USERNAME}"
 
 LAVA_INVOICE_API_URL = "https://gate.lava.top/api/v3/invoice"
 LAVA_SUBSCRIPTION_OFFER_ID = "70ca1de2-4073-4ca4-abb8-a964003fe500"
-DEFAULT_PAYMENT_PROVIDER = "UNLIMIT"
-DEFAULT_PAYMENT_METHOD = "CARD"
 DEFAULT_PERIODICITY = "MONTHLY"
 
 ALLOWED_CURRENCIES = {"USD", "EUR", "RUB"}
@@ -382,7 +380,7 @@ def extract_status(payload: dict) -> Optional[str]:
     return str(status)
 
 
-def create_lava_invoice(email: str, currency: str) -> dict:
+def build_invoice_payload(email: str, currency: str) -> dict:
     currency = currency.upper().strip()
 
     if currency not in ALLOWED_CURRENCIES:
@@ -395,10 +393,20 @@ def create_lava_invoice(email: str, currency: str) -> dict:
         "email": email,
         "offerId": LAVA_SUBSCRIPTION_OFFER_ID,
         "currency": currency,
-        "paymentProvider": DEFAULT_PAYMENT_PROVIDER,
-        "paymentMethod": DEFAULT_PAYMENT_METHOD,
         "periodicity": DEFAULT_PERIODICITY,
     }
+
+    if currency == "RUB":
+        payload["paymentProvider"] = "SMART_GLOCAL"
+    else:
+        payload["paymentProvider"] = "UNLIMIT"
+        payload["paymentMethod"] = "CARD"
+
+    return payload
+
+
+def create_lava_invoice(email: str, currency: str) -> dict:
+    payload = build_invoice_payload(email=email, currency=currency)
 
     req = urllib.request.Request(
         LAVA_INVOICE_API_URL,
@@ -538,7 +546,7 @@ def success_page() -> str:
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Оплата получена</title>
+        <title>Оплата почти завершена</title>
         <style>
             body {{
                 margin: 0;
