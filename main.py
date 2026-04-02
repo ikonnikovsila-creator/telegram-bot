@@ -68,7 +68,8 @@ LAVA_SUBSCRIPTION_OFFER_ID = os.getenv(
 )
 DEFAULT_PERIODICITY = "MONTHLY"
 
-# Необязательные env: только для строки "Стоимость" на экране подтверждения.
+# Эти env нужны только для отображения стоимости на экране подтверждения.
+# Если оставить пустыми - строка "Стоимость" просто не покажется.
 DISPLAY_PRICE_RF = os.getenv("DISPLAY_PRICE_RF", "")
 DISPLAY_PRICE_FOREIGN = os.getenv("DISPLAY_PRICE_FOREIGN", "")
 DISPLAY_PRICE_PAYPAL = os.getenv("DISPLAY_PRICE_PAYPAL", "")
@@ -641,10 +642,7 @@ def create_lava_invoice(email: str, currency: str, payment_route: str) -> dict:
 
     except Exception as e:
         logging.exception("Unexpected Lava invoice error: %s", str(e))
-        raise HTTPException(
-            status_code=500,
-            detail=f"Неожиданная ошибка при создании invoice: {str(e)}",
-        )
+        raise HTTPException(status_code=500, detail=f"Неожиданная ошибка при создании invoice: {str(e)}")
 
 
 def is_successful_payment(event_type: Optional[str], status: Optional[str]) -> bool:
