@@ -47,7 +47,7 @@ if not DATABASE_URL:
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
     "https://zooming-acceptance-production-b914.up.railway.app",
-)
+).rstrip("/")
 
 PRIVATE_CHANNEL_CHAT_ID = os.getenv("PRIVATE_CHANNEL_CHAT_ID")
 if not PRIVATE_CHANNEL_CHAT_ID:
@@ -57,16 +57,24 @@ PUBLIC_CHANNEL_CHAT_ID = os.getenv("PUBLIC_CHANNEL_CHAT_ID")
 if not PUBLIC_CHANNEL_CHAT_ID:
     raise RuntimeError("PUBLIC_CHANNEL_CHAT_ID не найден в переменных окружения")
 
-TELEGRAM_BOT_USERNAME = "tochka_opory_access_bot"
+TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "tochka_opory_access_bot")
 TELEGRAM_BOT_URL = f"https://t.me/{TELEGRAM_BOT_USERNAME}"
 TELEGRAM_BOT_START_FROM_VITRINA_URL = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=from_vitrina"
 
 LAVA_INVOICE_API_URL = "https://gate.lava.top/api/v3/invoice"
-LAVA_SUBSCRIPTION_OFFER_ID = "70ca1de2-4073-4ca4-abb8-a964003fe500"
+LAVA_SUBSCRIPTION_OFFER_ID = os.getenv(
+    "LAVA_SUBSCRIPTION_OFFER_ID",
+    "70ca1de2-4073-4ca4-abb8-a964003fe500",
+)
 DEFAULT_PERIODICITY = "MONTHLY"
 
-ALLOWED_CURRENCIES = {"USD", "EUR", "RUB"}
-ALLOWED_PAYMENT_ROUTES = {"CARD", "PAYPAL", "SBP"}
+DISPLAY_PRICE_RF = os.getenv("DISPLAY_PRICE_RF", "")
+DISPLAY_PRICE_FOREIGN = os.getenv("DISPLAY_PRICE_FOREIGN", "")
+DISPLAY_PRICE_PAYPAL = os.getenv("DISPLAY_PRICE_PAYPAL", "")
+
+ALLOWED_CURRENCIES = {"USD", "RUB"}
+ALLOWED_PAYMENT_ROUTES = {"CARD", "PAYPAL"}
+ALLOWED_PAYMENT_METHODS = {"rf_card", "foreign_card", "paypal"}
 
 PUBLIC_ENTRY_POST_TEXT = (
     "Здесь не утешают, здесь проясняют.\n\n"
@@ -74,6 +82,13 @@ PUBLIC_ENTRY_POST_TEXT = (
     "Внутри - тексты и разборы о тревоге, внимании, мыслях, отношениях и внутренней собранности.\n\n"
     "Нажми на кнопку ниже.\n"
     "Дальше бот сам проведёт тебя по шагам."
+)
+
+START_TEXT = (
+    "Доступ в Точку опоры.\n\n"
+    "Нажми на кнопку ниже.\n"
+    "Откроется тёмный экран выбора оплаты.\n"
+    "После оплаты бот сам пришлёт персональную ссылку на вход в закрытый канал."
 )
 
 app = FastAPI()
@@ -135,6 +150,7 @@ def init_db() -> None:
                 last_event_type TEXT,
                 access_invite_sent_at TIMESTAMP,
                 access_granted_at TIMESTAMP,
+                access_revoked_at TIMESTAMP,
                 pending_access_invite_link TEXT,
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW(),
@@ -197,6 +213,13 @@ def init_db() -> None:
             """
             ALTER TABLE invoices
             ADD COLUMN IF NOT EXISTS access_granted_at TIMESTAMP
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS access_revoked_at TIMESTAMP
             """
         )
 
@@ -406,72 +429,60 @@ def normalize_payment_route(payment_route: Optional[str]) -> str:
     return route
 
 
+def normalize_payment_method(method: str) -> str:
+    normalized = method.strip().lower()
+    if normalized not in ALLOWED_PAYMENT_METHODS:
+        raise HTTPException(status_code=400, detail=f"Неподдерживаемый способ оплаты: {method}")
+    return normalized
+
+
+def map_payment_method(method: str) -> dict:
+    normalized = normalize_payment_method(method)
+
+    if normalized == "rf_card":
+        return {
+            "currency": "RUB",
+            "route": "CARD",
+            "label": "Оплата картами РФ",
+            "display_price": DISPLAY_PRICE_RF,
+        }
+
+    if normalized == "foreign_card":
+        return {
+            "currency": "USD",
+            "route": "CARD",
+            "label": "Оплата любой другой картой",
+            "display_price": DISPLAY_PRICE_FOREIGN,
+        }
+
+    return {
+        "currency": "USD",
+        "route": "PAYPAL",
+        "label": "PayPal",
+        "display_price": DISPLAY_PRICE_PAYPAL,
+    }
+
+
 def get_payment_route_label(currency: str, payment_route: str) -> str:
     currency = normalize_currency(currency)
     payment_route = normalize_payment_route(payment_route)
 
-    if payment_route == "SBP":
-        return "СБП"
     if payment_route == "PAYPAL":
         return "PayPal"
     if currency == "RUB":
-        return "RUB / карта"
-    if currency == "EUR":
-        return "EUR / карта"
-    return "USD / карта"
+        return "Оплата картами РФ"
+    return "Оплата любой другой картой"
 
 
-def build_payment_link(
-    telegram_user_id: int,
-    email: str,
-    currency: str,
-    payment_route: str,
-) -> str:
-    query = urllib.parse.urlencode(
-        {
-            "tg_user_id": telegram_user_id,
-            "email": email,
-            "currency": currency,
-            "route": payment_route,
-        }
+def build_checkout_url(telegram_user_id: int) -> str:
+    query = urllib.parse.urlencode({"tg_user_id": telegram_user_id})
+    return f"{PUBLIC_BASE_URL}/checkout?{query}"
+
+
+def build_start_keyboard(telegram_user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Открыть доступ", url=build_checkout_url(telegram_user_id))]]
     )
-    return f"{PUBLIC_BASE_URL}/create-payment?{query}"
-
-
-def create_payment_keyboard(telegram_user_id: int, email: str) -> InlineKeyboardMarkup:
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "Оплатить в RUB",
-                url=build_payment_link(telegram_user_id, email, "RUB", "CARD"),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "Оплатить через СБП",
-                url=build_payment_link(telegram_user_id, email, "RUB", "SBP"),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "Оплатить в USD",
-                url=build_payment_link(telegram_user_id, email, "USD", "CARD"),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "Оплатить в EUR",
-                url=build_payment_link(telegram_user_id, email, "EUR", "CARD"),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "Оплатить через PayPal",
-                url=build_payment_link(telegram_user_id, email, "USD", "PAYPAL"),
-            )
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
 
 
 def find_first_value(data: Any, target_keys: set[str]) -> Optional[Any]:
@@ -586,13 +597,7 @@ def build_invoice_payload(email: str, currency: str, payment_route: str) -> dict
     if currency == "RUB" and payment_route == "PAYPAL":
         raise HTTPException(
             status_code=400,
-            detail="PayPal недоступен для RUB-маршрута",
-        )
-
-    if currency in {"USD", "EUR"} and payment_route == "SBP":
-        raise HTTPException(
-            status_code=400,
-            detail="СБП доступен только для RUB-маршрута",
+            detail="PayPal недоступен для рублёвого маршрута",
         )
 
     payload = {
@@ -689,6 +694,29 @@ def is_successful_payment(event_type: Optional[str], status: Optional[str]) -> b
     return normalized_event in success_events or normalized_status in success_statuses
 
 
+def is_failed_or_inactive_payment(event_type: Optional[str], status: Optional[str]) -> bool:
+    normalized_event = (event_type or "").strip().lower()
+    normalized_status = (status or "").strip().lower()
+
+    failed_events = {
+        "payment.failed",
+        "payment_failed",
+        "subscription.payment.failed",
+    }
+
+    failed_statuses = {
+        "subscription-failed",
+        "failed",
+        "declined",
+        "expired",
+        "inactive",
+        "cancelled",
+        "canceled",
+    }
+
+    return normalized_event in failed_events or normalized_status in failed_statuses
+
+
 def send_telegram_api_request(method: str, payload: dict) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = json.dumps(payload).encode("utf-8")
@@ -778,6 +806,35 @@ def decline_join_request(user_id: int) -> None:
     )
 
 
+def remove_member_from_private_channel(user_id: int) -> None:
+    until_date = int((datetime.now(timezone.utc) + timedelta(seconds=60)).timestamp())
+
+    try:
+        send_telegram_api_request(
+            "banChatMember",
+            {
+                "chat_id": int(PRIVATE_CHANNEL_CHAT_ID),
+                "user_id": user_id,
+                "until_date": until_date,
+                "revoke_messages": False,
+            },
+        )
+    except Exception:
+        logging.exception("Не удалось удалить пользователя из канала: user_id=%s", user_id)
+
+    try:
+        send_telegram_api_request(
+            "unbanChatMember",
+            {
+                "chat_id": int(PRIVATE_CHANNEL_CHAT_ID),
+                "user_id": user_id,
+                "only_if_banned": True,
+            },
+        )
+    except Exception:
+        logging.exception("Не удалось снять временный бан после удаления: user_id=%s", user_id)
+
+
 def resolve_invoice_row(
     lava_invoice_id: Optional[str],
     contract_id: Optional[str],
@@ -787,16 +844,22 @@ def resolve_invoice_row(
     try:
         cur = conn.cursor()
 
+        select_sql = """
+            SELECT
+                id,
+                telegram_user_id,
+                status,
+                access_invite_sent_at,
+                access_granted_at,
+                access_revoked_at,
+                pending_access_invite_link
+            FROM invoices
+            WHERE {condition}
+            LIMIT 1
+        """
+
         if lava_invoice_id:
-            cur.execute(
-                """
-                SELECT id, telegram_user_id, status, access_invite_sent_at, pending_access_invite_link
-                FROM invoices
-                WHERE lava_invoice_id = %s
-                LIMIT 1
-                """,
-                (lava_invoice_id,),
-            )
+            cur.execute(select_sql.format(condition="lava_invoice_id = %s"), (lava_invoice_id,))
             row = cur.fetchone()
             if row:
                 cur.close()
@@ -805,19 +868,13 @@ def resolve_invoice_row(
                     "telegram_user_id": row[1],
                     "status": row[2],
                     "access_invite_sent_at": row[3],
-                    "pending_access_invite_link": row[4],
+                    "access_granted_at": row[4],
+                    "access_revoked_at": row[5],
+                    "pending_access_invite_link": row[6],
                 }
 
         if contract_id:
-            cur.execute(
-                """
-                SELECT id, telegram_user_id, status, access_invite_sent_at, pending_access_invite_link
-                FROM invoices
-                WHERE contract_id = %s
-                LIMIT 1
-                """,
-                (contract_id,),
-            )
+            cur.execute(select_sql.format(condition="contract_id = %s"), (contract_id,))
             row = cur.fetchone()
             if row:
                 cur.close()
@@ -826,13 +883,22 @@ def resolve_invoice_row(
                     "telegram_user_id": row[1],
                     "status": row[2],
                     "access_invite_sent_at": row[3],
-                    "pending_access_invite_link": row[4],
+                    "access_granted_at": row[4],
+                    "access_revoked_at": row[5],
+                    "pending_access_invite_link": row[6],
                 }
 
         if buyer_email:
             cur.execute(
                 """
-                SELECT id, telegram_user_id, status, access_invite_sent_at, pending_access_invite_link
+                SELECT
+                    id,
+                    telegram_user_id,
+                    status,
+                    access_invite_sent_at,
+                    access_granted_at,
+                    access_revoked_at,
+                    pending_access_invite_link
                 FROM invoices
                 WHERE LOWER(email) = %s
                 ORDER BY created_at DESC
@@ -848,7 +914,9 @@ def resolve_invoice_row(
                     "telegram_user_id": row[1],
                     "status": row[2],
                     "access_invite_sent_at": row[3],
-                    "pending_access_invite_link": row[4],
+                    "access_granted_at": row[4],
+                    "access_revoked_at": row[5],
+                    "pending_access_invite_link": row[6],
                 }
 
         cur.close()
@@ -934,6 +1002,30 @@ def mark_access_granted(invoice_db_id: int) -> None:
             """
             UPDATE invoices
             SET access_granted_at = NOW(),
+                access_revoked_at = NULL,
+                pending_access_invite_link = NULL,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (invoice_db_id,),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def mark_access_revoked(invoice_db_id: int) -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE invoices
+            SET access_revoked_at = NOW(),
+                access_granted_at = NULL,
+                access_invite_sent_at = NULL,
+                pending_access_invite_link = NULL,
                 updated_at = NOW()
             WHERE id = %s
             """,
@@ -987,8 +1079,12 @@ def send_access_request_link_if_paid(
         )
         return
 
-    if invoice_row.get("access_invite_sent_at"):
-        logging.info("Access request link already sent for invoice db id=%s", invoice_row["id"])
+    if invoice_row.get("access_granted_at"):
+        logging.info("Access already granted for invoice db id=%s", invoice_row["id"])
+        return
+
+    if invoice_row.get("access_invite_sent_at") and invoice_row.get("pending_access_invite_link"):
+        logging.info("Access join-request link already sent for invoice db id=%s", invoice_row["id"])
         return
 
     telegram_user_id = invoice_row.get("telegram_user_id")
@@ -1019,60 +1115,82 @@ def send_access_request_link_if_paid(
     )
 
 
+def revoke_access_if_needed(
+    invoice_row: dict,
+    event_type: Optional[str],
+    status: Optional[str],
+) -> None:
+    if not is_failed_or_inactive_payment(event_type, status):
+        return
+
+    telegram_user_id = invoice_row.get("telegram_user_id")
+    if not telegram_user_id:
+        return
+
+    has_any_access_state = bool(
+        invoice_row.get("access_granted_at") or invoice_row.get("access_invite_sent_at")
+    )
+    if not has_any_access_state:
+        logging.info(
+            "Failure webhook received, but access was not granted yet: invoice_db_id=%s",
+            invoice_row["id"],
+        )
+        return
+
+    remove_member_from_private_channel(telegram_user_id)
+    mark_access_revoked(invoice_row["id"])
+
+    try:
+        send_telegram_text(
+            telegram_user_id,
+            "Подписка не продлена.\n"
+            "Доступ в канал остановлен.\n\n"
+            "Чтобы вернуться, снова открой бота и оформи доступ заново.",
+        )
+    except Exception:
+        logging.exception(
+            "Не удалось отправить уведомление о снятии доступа: telegram_user_id=%s",
+            telegram_user_id,
+        )
+
+    logging.info(
+        "Access revoked after failed/inactive payment: invoice_db_id=%s telegram_user_id=%s",
+        invoice_row["id"],
+        telegram_user_id,
+    )
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_user(update)
-    context.user_data["awaiting_email"] = True
 
-    if update.message:
-        await update.message.reply_text(
-            "Отправь свой email для оформления оплаты.\n\n"
-            "После этого я пришлю кнопки оплаты:\n"
-            "- RUB\n"
-            "- СБП\n"
-            "- USD\n"
-            "- EUR\n"
-            "- PayPal"
-        )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(
-            "Нажми /start, отправь email и выбери удобный способ оплаты."
-        )
-
-
-async def handle_email_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
 
-    if not context.user_data.get("awaiting_email"):
+    await update.message.reply_text(
+        START_TEXT,
+        reply_markup=build_start_keyboard(update.effective_user.id),
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
         return
 
-    email = update.message.text.strip()
+    await update.message.reply_text(
+        START_TEXT,
+        reply_markup=build_start_keyboard(update.effective_user.id),
+    )
 
-    if not is_valid_email(email):
-        await update.message.reply_text(
-            "Это не похоже на корректный email. Отправь нормальный email ещё раз."
-        )
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
         return
 
     save_user(update)
-    save_user_email(update.effective_user.id, email)
-
-    context.user_data["awaiting_email"] = False
-    context.user_data["email"] = email
-
-    reply_markup = create_payment_keyboard(update.effective_user.id, email)
 
     await update.message.reply_text(
-        "Отлично. Теперь выбери способ оплаты.\n\n"
-        "Подсказка:\n"
-        "- RUB или СБП - для РФ\n"
-        "- USD / EUR - для зарубежных карт\n"
-        "- PayPal - для тех, у кого удобнее этот маршрут\n\n"
-        "Если один вариант не проходит, попробуй другой.",
-        reply_markup=reply_markup,
+        "Нажми кнопку ниже, чтобы открыть доступ.",
+        reply_markup=build_start_keyboard(update.effective_user.id),
     )
 
 
@@ -1149,7 +1267,7 @@ async def run_bot() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email_message)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
 
     await application.initialize()
@@ -1178,6 +1296,393 @@ def root() -> dict:
     return {"status": "ok", "message": "Telegram bot is running"}
 
 
+@app.get("/checkout", response_class=HTMLResponse)
+def checkout_page(tg_user_id: int) -> str:
+    return f"""
+    <!doctype html>
+    <html lang="ru">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1.0">
+        <title>Доступ в Точку опоры</title>
+        <style>
+            * {{
+                box-sizing: border-box;
+            }}
+
+            body {{
+                margin: 0;
+                min-height: 100vh;
+                background: #050505;
+                color: #f5f5f5;
+                font-family: Arial, sans-serif;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 24px;
+            }}
+
+            .card {{
+                position: relative;
+                width: 100%;
+                max-width: 520px;
+                background: #0b0b0c;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 24px;
+                padding: 28px 22px 22px;
+                overflow: hidden;
+                box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+            }}
+
+            .watermark {{
+                position: absolute;
+                top: 18px;
+                left: 50%;
+                transform: translateX(-50%);
+                width: 160px;
+                height: 160px;
+                opacity: 0.12;
+                pointer-events: none;
+            }}
+
+            .content {{
+                position: relative;
+                z-index: 1;
+            }}
+
+            .eyebrow {{
+                margin: 96px 0 10px;
+                text-align: center;
+                font-size: 12px;
+                letter-spacing: 0.18em;
+                text-transform: uppercase;
+                color: #9ca3af;
+            }}
+
+            h1 {{
+                margin: 0 0 12px;
+                text-align: center;
+                font-size: 30px;
+                line-height: 1.12;
+                font-weight: 700;
+            }}
+
+            .subtitle {{
+                margin: 0 0 24px;
+                text-align: center;
+                color: #b5b8be;
+                font-size: 15px;
+                line-height: 1.5;
+            }}
+
+            .step {{
+                display: none;
+            }}
+
+            .step.active {{
+                display: block;
+            }}
+
+            .stack {{
+                display: grid;
+                gap: 12px;
+            }}
+
+            .option-btn,
+            .action-btn,
+            .secondary-btn {{
+                appearance: none;
+                width: 100%;
+                border: none;
+                border-radius: 16px;
+                cursor: pointer;
+                transition: transform 0.15s ease, opacity 0.15s ease, border-color 0.15s ease;
+                font-size: 16px;
+                line-height: 1.25;
+            }}
+
+            .option-btn:hover,
+            .action-btn:hover,
+            .secondary-btn:hover {{
+                transform: translateY(-1px);
+            }}
+
+            .option-btn {{
+                text-align: left;
+                padding: 18px 18px;
+                background: #121316;
+                color: #ffffff;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+            }}
+
+            .option-btn .title {{
+                display: block;
+                font-weight: 700;
+                margin-bottom: 4px;
+            }}
+
+            .option-btn .desc {{
+                display: block;
+                color: #a1a1aa;
+                font-size: 13px;
+            }}
+
+            .label {{
+                display: block;
+                margin-bottom: 8px;
+                font-size: 14px;
+                color: #d1d5db;
+            }}
+
+            .input {{
+                width: 100%;
+                padding: 16px 16px;
+                border-radius: 16px;
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                background: #101114;
+                color: #ffffff;
+                outline: none;
+                font-size: 16px;
+            }}
+
+            .input:focus {{
+                border-color: rgba(255, 255, 255, 0.25);
+            }}
+
+            .hint {{
+                margin-top: 10px;
+                color: #8f95a3;
+                font-size: 13px;
+                line-height: 1.45;
+            }}
+
+            .summary {{
+                display: grid;
+                gap: 10px;
+                background: #101114;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 18px;
+                padding: 16px;
+                margin-bottom: 18px;
+            }}
+
+            .summary-row {{
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 14px;
+                font-size: 15px;
+            }}
+
+            .summary-label {{
+                color: #9ca3af;
+            }}
+
+            .summary-value {{
+                text-align: right;
+                color: #ffffff;
+                font-weight: 600;
+                word-break: break-word;
+            }}
+
+            .action-btn {{
+                padding: 16px 18px;
+                background: #f3f4f6;
+                color: #111111;
+                font-weight: 700;
+            }}
+
+            .secondary-btn {{
+                padding: 14px 18px;
+                background: transparent;
+                color: #cbd5e1;
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                margin-top: 12px;
+            }}
+
+            .error {{
+                min-height: 18px;
+                margin-top: 10px;
+                color: #fda4af;
+                font-size: 13px;
+                text-align: center;
+            }}
+
+            .footnote {{
+                margin-top: 18px;
+                text-align: center;
+                color: #7d8593;
+                font-size: 12px;
+                line-height: 1.45;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <svg class="watermark" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <circle cx="100" cy="100" r="10" fill="white"/>
+                <circle
+                    cx="100"
+                    cy="100"
+                    r="62"
+                    stroke="white"
+                    stroke-width="14"
+                    stroke-linecap="round"
+                    stroke-dasharray="72 26 72 26 72 26 72 26"
+                    transform="rotate(-45 100 100)"
+                />
+            </svg>
+
+            <div class="content">
+                <div class="eyebrow">точка ясности</div>
+                <h1>Доступ в Точку опоры</h1>
+                <p class="subtitle">
+                    Выбери способ оплаты. Дальше система сама переведёт тебя на нужный маршрут.
+                </p>
+
+                <div id="step-method" class="step active">
+                    <div class="stack">
+                        <button class="option-btn" onclick="chooseMethod('rf_card')">
+                            <span class="title">Оплата картами РФ</span>
+                            <span class="desc">Рублёвый маршрут для карт российских банков.</span>
+                        </button>
+
+                        <button class="option-btn" onclick="chooseMethod('foreign_card')">
+                            <span class="title">Оплата любой другой картой</span>
+                            <span class="desc">Маршрут для зарубежных карт с автоматической конвертацией.</span>
+                        </button>
+
+                        <button class="option-btn" onclick="chooseMethod('paypal')">
+                            <span class="title">PayPal</span>
+                            <span class="desc">Отдельный маршрут через PayPal.</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div id="step-email" class="step">
+                    <label class="label" for="email">Введите ваш email</label>
+                    <input id="email" class="input" type="email" placeholder="name@example.com" autocomplete="email">
+                    <div class="hint">
+                        На этот email будет привязана оплата. После подтверждения бот пришлёт ссылку на вход в закрытый канал.
+                    </div>
+                    <div class="error" id="email-error"></div>
+                    <button class="action-btn" style="margin-top: 18px;" onclick="goToConfirm()">Далее</button>
+                    <button class="secondary-btn" onclick="showStep('step-method')">Назад</button>
+                </div>
+
+                <div id="step-confirm" class="step">
+                    <div class="summary">
+                        <div class="summary-row">
+                            <div class="summary-label">Продукт</div>
+                            <div class="summary-value">Доступ в Точку опоры</div>
+                        </div>
+                        <div class="summary-row">
+                            <div class="summary-label">Способ оплаты</div>
+                            <div class="summary-value" id="summary-method"></div>
+                        </div>
+                        <div class="summary-row">
+                            <div class="summary-label">Email</div>
+                            <div class="summary-value" id="summary-email"></div>
+                        </div>
+                        <div class="summary-row" id="summary-price-row" style="display:none;">
+                            <div class="summary-label">Стоимость</div>
+                            <div class="summary-value" id="summary-price"></div>
+                        </div>
+                    </div>
+
+                    <button class="action-btn" onclick="goToPayment()">Перейти к оплате</button>
+                    <button class="secondary-btn" onclick="showStep('step-email')">Вернуться назад</button>
+                </div>
+
+                <div class="footnote">
+                    Если после оплаты что-то пошло не так, просто вернись в Telegram и открой бота ещё раз.
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const tgUserId = {tg_user_id};
+            const methods = {{
+                rf_card: {{
+                    label: "Оплата картами РФ",
+                    displayPrice: {json.dumps(DISPLAY_PRICE_RF)},
+                }},
+                foreign_card: {{
+                    label: "Оплата любой другой картой",
+                    displayPrice: {json.dumps(DISPLAY_PRICE_FOREIGN)},
+                }},
+                paypal: {{
+                    label: "PayPal",
+                    displayPrice: {json.dumps(DISPLAY_PRICE_PAYPAL)},
+                }},
+            }};
+
+            let selectedMethod = null;
+
+            function showStep(stepId) {{
+                document.querySelectorAll(".step").forEach((el) => el.classList.remove("active"));
+                document.getElementById(stepId).classList.add("active");
+            }}
+
+            function chooseMethod(method) {{
+                selectedMethod = method;
+                document.getElementById("email-error").textContent = "";
+                showStep("step-email");
+            }}
+
+            function validateEmail(email) {{
+                const pattern = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{{2,}}$/;
+                return pattern.test(String(email).trim());
+            }}
+
+            function goToConfirm() {{
+                const emailInput = document.getElementById("email");
+                const email = emailInput.value.trim();
+                const errorBox = document.getElementById("email-error");
+
+                if (!selectedMethod) {{
+                    errorBox.textContent = "Сначала выбери способ оплаты.";
+                    showStep("step-method");
+                    return;
+                }}
+
+                if (!validateEmail(email)) {{
+                    errorBox.textContent = "Введите корректный email.";
+                    return;
+                }}
+
+                errorBox.textContent = "";
+                document.getElementById("summary-method").textContent = methods[selectedMethod].label;
+                document.getElementById("summary-email").textContent = email;
+
+                const priceRow = document.getElementById("summary-price-row");
+                const priceValue = document.getElementById("summary-price");
+                if (methods[selectedMethod].displayPrice) {{
+                    priceRow.style.display = "flex";
+                    priceValue.textContent = methods[selectedMethod].displayPrice;
+                }} else {{
+                    priceRow.style.display = "none";
+                    priceValue.textContent = "";
+                }}
+
+                showStep("step-confirm");
+            }}
+
+            function goToPayment() {{
+                const email = document.getElementById("email").value.trim();
+                const query = new URLSearchParams({{
+                    tg_user_id: String(tgUserId),
+                    email: email,
+                    method: selectedMethod,
+                }});
+                window.location.href = "{PUBLIC_BASE_URL}/create-payment?" + query.toString();
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+
 @app.get("/success", response_class=HTMLResponse)
 def success_page() -> str:
     return f"""
@@ -1191,7 +1696,7 @@ def success_page() -> str:
             body {{
                 margin: 0;
                 padding: 0;
-                background: #0f0f10;
+                background: #050505;
                 color: #f5f5f5;
                 font-family: Arial, sans-serif;
                 display: flex;
@@ -1203,8 +1708,9 @@ def success_page() -> str:
                 width: 100%;
                 max-width: 560px;
                 padding: 32px 24px;
-                border-radius: 20px;
-                background: #18181b;
+                border-radius: 22px;
+                background: #0b0b0c;
+                border: 1px solid rgba(255,255,255,0.08);
                 box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
                 text-align: center;
                 box-sizing: border-box;
@@ -1269,18 +1775,27 @@ def publish_public_entry_post():
 def create_payment(
     tg_user_id: int,
     email: str,
-    currency: str,
-    route: Optional[str] = "CARD",
+    method: Optional[str] = None,
+    currency: Optional[str] = None,
+    route: Optional[str] = None,
 ):
     if not is_valid_email(email):
         raise HTTPException(status_code=400, detail="Некорректный email")
 
-    normalized_currency = normalize_currency(currency)
-    normalized_route = normalize_payment_route(route)
-    payment_route_label = get_payment_route_label(
-        normalized_currency,
-        normalized_route,
-    )
+    if method:
+        mapped = map_payment_method(method)
+        normalized_currency = mapped["currency"]
+        normalized_route = mapped["route"]
+        payment_route_label = mapped["label"]
+    else:
+        if not currency:
+            raise HTTPException(status_code=400, detail="Не передан способ оплаты")
+        normalized_currency = normalize_currency(currency)
+        normalized_route = normalize_payment_route(route)
+        payment_route_label = get_payment_route_label(
+            normalized_currency,
+            normalized_route,
+        )
 
     result = create_lava_invoice(
         email=email,
@@ -1297,6 +1812,8 @@ def create_payment(
             status_code=502,
             detail="Lava не вернула paymentUrl",
         )
+
+    save_user_email(tg_user_id, email)
 
     save_invoice_record(
         telegram_user_id=tg_user_id,
@@ -1397,6 +1914,12 @@ async def handle_lava_webhook(
         buyer_email=buyer_email,
         product_id=product_id,
         product_title=product_title,
+    )
+
+    revoke_access_if_needed(
+        invoice_row=invoice_row,
+        event_type=event_type,
+        status=status,
     )
 
     send_access_request_link_if_paid(
