@@ -68,6 +68,7 @@ LAVA_SUBSCRIPTION_OFFER_ID = os.getenv(
 )
 DEFAULT_PERIODICITY = "MONTHLY"
 
+# Необязательные env: только для строки "Стоимость" на экране подтверждения.
 DISPLAY_PRICE_RF = os.getenv("DISPLAY_PRICE_RF", "")
 DISPLAY_PRICE_FOREIGN = os.getenv("DISPLAY_PRICE_FOREIGN", "")
 DISPLAY_PRICE_PAYPAL = os.getenv("DISPLAY_PRICE_PAYPAL", "")
@@ -85,9 +86,9 @@ PUBLIC_ENTRY_POST_TEXT = (
 )
 
 START_TEXT = (
-    "Доступ в Точку опоры.\n\n"
+    "Точка опоры - подписка на 1 месяц.\n\n"
     "Нажми на кнопку ниже.\n"
-    "Откроется тёмный экран выбора оплаты.\n"
+    "Откроется экран выбора оплаты.\n"
     "После оплаты бот сам пришлёт персональную ссылку на вход в закрытый канал."
 )
 
@@ -296,11 +297,12 @@ def save_user_email(telegram_user_id: int, email: str) -> None:
         cur = conn.cursor()
         cur.execute(
             """
-            UPDATE users
-            SET email = %s
-            WHERE telegram_user_id = %s
+            INSERT INTO users (telegram_user_id, email)
+            VALUES (%s, %s)
+            ON CONFLICT (telegram_user_id)
+            DO UPDATE SET email = EXCLUDED.email
             """,
-            (email, telegram_user_id),
+            (telegram_user_id, email),
         )
         conn.commit()
         cur.close()
@@ -412,20 +414,14 @@ def is_valid_email(email: str) -> bool:
 def normalize_currency(currency: str) -> str:
     normalized = currency.upper().strip()
     if normalized not in ALLOWED_CURRENCIES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Неподдерживаемая валюта: {currency}",
-        )
+        raise HTTPException(status_code=400, detail=f"Неподдерживаемая валюта: {currency}")
     return normalized
 
 
 def normalize_payment_route(payment_route: Optional[str]) -> str:
     route = (payment_route or "CARD").upper().strip()
     if route not in ALLOWED_PAYMENT_ROUTES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Неподдерживаемый маршрут оплаты: {payment_route}",
-        )
+        raise HTTPException(status_code=400, detail=f"Неподдерживаемый маршрут оплаты: {payment_route}")
     return route
 
 
@@ -531,13 +527,7 @@ def extract_lava_invoice_id(payload: dict) -> Optional[str]:
 def extract_status(payload: dict) -> Optional[str]:
     status = find_first_value(
         payload,
-        {
-            "status",
-            "paymentStatus",
-            "payment_status",
-            "invoiceStatus",
-            "invoice_status",
-        },
+        {"status", "paymentStatus", "payment_status", "invoiceStatus", "invoice_status"},
     )
     if status is None:
         return None
@@ -595,10 +585,7 @@ def build_invoice_payload(email: str, currency: str, payment_route: str) -> dict
     payment_route = normalize_payment_route(payment_route)
 
     if currency == "RUB" and payment_route == "PAYPAL":
-        raise HTTPException(
-            status_code=400,
-            detail="PayPal недоступен для рублёвого маршрута",
-        )
+        raise HTTPException(status_code=400, detail="PayPal недоступен для рублёвого маршрута")
 
     payload = {
         "email": email,
@@ -616,11 +603,7 @@ def build_invoice_payload(email: str, currency: str, payment_route: str) -> dict
 
 
 def create_lava_invoice(email: str, currency: str, payment_route: str) -> dict:
-    payload = build_invoice_payload(
-        email=email,
-        currency=currency,
-        payment_route=payment_route,
-    )
+    payload = build_invoice_payload(email=email, currency=currency, payment_route=payment_route)
 
     req = urllib.request.Request(
         LAVA_INVOICE_API_URL,
@@ -642,11 +625,7 @@ def create_lava_invoice(email: str, currency: str, payment_route: str) -> dict:
 
     except urllib.error.HTTPError as e:
         raw_error = e.read().decode("utf-8", errors="replace")
-        logging.exception(
-            "Lava invoice HTTP error: status=%s body=%s",
-            e.code,
-            raw_error,
-        )
+        logging.exception("Lava invoice HTTP error: status=%s body=%s", e.code, raw_error)
         raise HTTPException(
             status_code=502,
             detail={
@@ -658,10 +637,7 @@ def create_lava_invoice(email: str, currency: str, payment_route: str) -> dict:
 
     except urllib.error.URLError as e:
         logging.exception("Lava invoice URL error: %s", str(e))
-        raise HTTPException(
-            status_code=502,
-            detail=f"Не удалось соединиться с Lava: {str(e)}",
-        )
+        raise HTTPException(status_code=502, detail=f"Не удалось соединиться с Lava: {str(e)}")
 
     except Exception as e:
         logging.exception("Unexpected Lava invoice error: %s", str(e))
@@ -675,12 +651,7 @@ def is_successful_payment(event_type: Optional[str], status: Optional[str]) -> b
     normalized_event = (event_type or "").strip().lower()
     normalized_status = (status or "").strip().lower()
 
-    success_events = {
-        "payment.success",
-        "payment_success",
-        "subscription.payment.success",
-    }
-
+    success_events = {"payment.success", "payment_success", "subscription.payment.success"}
     success_statuses = {
         "success",
         "succeeded",
@@ -698,12 +669,7 @@ def is_failed_or_inactive_payment(event_type: Optional[str], status: Optional[st
     normalized_event = (event_type or "").strip().lower()
     normalized_status = (status or "").strip().lower()
 
-    failed_events = {
-        "payment.failed",
-        "payment_failed",
-        "subscription.payment.failed",
-    }
-
+    failed_events = {"payment.failed", "payment_failed", "subscription.payment.failed"}
     failed_statuses = {
         "subscription-failed",
         "failed",
@@ -724,10 +690,7 @@ def send_telegram_api_request(method: str, payload: dict) -> dict:
     req = urllib.request.Request(
         url,
         data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
 
@@ -742,13 +705,7 @@ def send_telegram_api_request(method: str, payload: dict) -> dict:
 
 
 def send_telegram_text(chat_id: int, text: str) -> None:
-    send_telegram_api_request(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text,
-        },
-    )
+    send_telegram_api_request("sendMessage", {"chat_id": chat_id, "text": text})
 
 
 def send_public_entry_post() -> dict:
@@ -789,20 +746,14 @@ def create_personal_join_request_link(label: str) -> str:
 def approve_join_request(user_id: int) -> None:
     send_telegram_api_request(
         "approveChatJoinRequest",
-        {
-            "chat_id": int(PRIVATE_CHANNEL_CHAT_ID),
-            "user_id": user_id,
-        },
+        {"chat_id": int(PRIVATE_CHANNEL_CHAT_ID), "user_id": user_id},
     )
 
 
 def decline_join_request(user_id: int) -> None:
     send_telegram_api_request(
         "declineChatJoinRequest",
-        {
-            "chat_id": int(PRIVATE_CHANNEL_CHAT_ID),
-            "user_id": user_id,
-        },
+        {"chat_id": int(PRIVATE_CHANNEL_CHAT_ID), "user_id": user_id},
     )
 
 
@@ -1115,11 +1066,7 @@ def send_access_request_link_if_paid(
     )
 
 
-def revoke_access_if_needed(
-    invoice_row: dict,
-    event_type: Optional[str],
-    status: Optional[str],
-) -> None:
+def revoke_access_if_needed(invoice_row: dict, event_type: Optional[str], status: Optional[str]) -> None:
     if not is_failed_or_inactive_payment(event_type, status):
         return
 
@@ -1127,10 +1074,10 @@ def revoke_access_if_needed(
     if not telegram_user_id:
         return
 
-    has_any_access_state = bool(
+    had_access_or_pending = bool(
         invoice_row.get("access_granted_at") or invoice_row.get("access_invite_sent_at")
     )
-    if not has_any_access_state:
+    if not had_access_or_pending:
         logging.info(
             "Failure webhook received, but access was not granted yet: invoice_db_id=%s",
             invoice_row["id"],
@@ -1145,7 +1092,7 @@ def revoke_access_if_needed(
             telegram_user_id,
             "Подписка не продлена.\n"
             "Доступ в канал остановлен.\n\n"
-            "Чтобы вернуться, снова открой бота и оформи доступ заново.",
+            "Чтобы вернуться, снова открой бота и оформи подписку заново.",
         )
     except Exception:
         logging.exception(
@@ -1194,10 +1141,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
-async def handle_chat_join_request(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def handle_chat_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     join_request = update.chat_join_request
     if not join_request:
         return
@@ -1266,9 +1210,7 @@ async def run_bot() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
-    )
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     await application.initialize()
     await application.start()
@@ -1304,7 +1246,7 @@ def checkout_page(tg_user_id: int) -> str:
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width,initial-scale=1.0">
-        <title>Доступ в Точку опоры</title>
+        <title>Точка опоры - подписка на 1 месяц</title>
         <style>
             * {{
                 box-sizing: border-box;
@@ -1325,23 +1267,22 @@ def checkout_page(tg_user_id: int) -> str:
             .card {{
                 position: relative;
                 width: 100%;
-                max-width: 520px;
+                max-width: 860px;
                 background: #0b0b0c;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 24px;
-                padding: 28px 22px 22px;
+                border: 1px solid rgba(255, 255, 255, 0.07);
+                border-radius: 30px;
+                padding: 36px 42px 28px;
                 overflow: hidden;
-                box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
             }}
 
-            .watermark {{
+            .logo {{
                 position: absolute;
-                top: 18px;
+                top: 24px;
                 left: 50%;
                 transform: translateX(-50%);
-                width: 160px;
-                height: 160px;
-                opacity: 0.12;
+                width: 132px;
+                height: 132px;
                 pointer-events: none;
             }}
 
@@ -1350,29 +1291,22 @@ def checkout_page(tg_user_id: int) -> str:
                 z-index: 1;
             }}
 
-            .eyebrow {{
-                margin: 96px 0 10px;
-                text-align: center;
-                font-size: 12px;
-                letter-spacing: 0.18em;
-                text-transform: uppercase;
-                color: #9ca3af;
-            }}
-
             h1 {{
-                margin: 0 0 12px;
+                margin: 128px 0 14px;
                 text-align: center;
-                font-size: 30px;
-                line-height: 1.12;
-                font-weight: 700;
+                font-size: 38px;
+                line-height: 1.08;
+                font-weight: 800;
+                letter-spacing: -0.02em;
+                color: #ffffff;
             }}
 
             .subtitle {{
-                margin: 0 0 24px;
+                margin: 0 0 28px;
                 text-align: center;
-                color: #b5b8be;
-                font-size: 15px;
-                line-height: 1.5;
+                color: #d1d5db;
+                font-size: 18px;
+                line-height: 1.45;
             }}
 
             .step {{
@@ -1385,7 +1319,9 @@ def checkout_page(tg_user_id: int) -> str:
 
             .stack {{
                 display: grid;
-                gap: 12px;
+                gap: 18px;
+                max-width: 740px;
+                margin: 0 auto;
             }}
 
             .option-btn,
@@ -1394,11 +1330,12 @@ def checkout_page(tg_user_id: int) -> str:
                 appearance: none;
                 width: 100%;
                 border: none;
-                border-radius: 16px;
+                border-radius: 20px;
                 cursor: pointer;
-                transition: transform 0.15s ease, opacity 0.15s ease, border-color 0.15s ease;
+                transition: transform 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
                 font-size: 16px;
-                line-height: 1.25;
+                line-height: 1.2;
+                font-family: inherit;
             }}
 
             .option-btn:hover,
@@ -1408,62 +1345,59 @@ def checkout_page(tg_user_id: int) -> str:
             }}
 
             .option-btn {{
-                text-align: left;
-                padding: 18px 18px;
+                text-align: center;
+                padding: 28px 24px;
                 background: #121316;
                 color: #ffffff;
                 border: 1px solid rgba(255, 255, 255, 0.08);
-            }}
-
-            .option-btn .title {{
-                display: block;
-                font-weight: 700;
-                margin-bottom: 4px;
-            }}
-
-            .option-btn .desc {{
-                display: block;
-                color: #a1a1aa;
-                font-size: 13px;
+                font-weight: 800;
+                font-size: 24px;
+                box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
             }}
 
             .label {{
                 display: block;
-                margin-bottom: 8px;
-                font-size: 14px;
-                color: #d1d5db;
+                margin: 0 auto 10px;
+                max-width: 740px;
+                font-size: 16px;
+                color: #e5e7eb;
             }}
 
             .input {{
                 width: 100%;
-                padding: 16px 16px;
-                border-radius: 16px;
+                max-width: 740px;
+                display: block;
+                margin: 0 auto;
+                padding: 18px 18px;
+                border-radius: 18px;
                 border: 1px solid rgba(255, 255, 255, 0.10);
                 background: #101114;
                 color: #ffffff;
                 outline: none;
-                font-size: 16px;
+                font-size: 17px;
             }}
 
             .input:focus {{
-                border-color: rgba(255, 255, 255, 0.25);
+                border-color: rgba(255, 255, 255, 0.24);
             }}
 
             .hint {{
-                margin-top: 10px;
+                max-width: 740px;
+                margin: 12px auto 0;
                 color: #8f95a3;
-                font-size: 13px;
+                font-size: 14px;
                 line-height: 1.45;
             }}
 
             .summary {{
                 display: grid;
-                gap: 10px;
+                gap: 12px;
                 background: #101114;
                 border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 18px;
-                padding: 16px;
-                margin-bottom: 18px;
+                border-radius: 20px;
+                padding: 18px;
+                margin: 0 auto 20px;
+                max-width: 740px;
             }}
 
             .summary-row {{
@@ -1471,7 +1405,7 @@ def checkout_page(tg_user_id: int) -> str:
                 align-items: flex-start;
                 justify-content: space-between;
                 gap: 14px;
-                font-size: 15px;
+                font-size: 16px;
             }}
 
             .summary-label {{
@@ -1481,81 +1415,145 @@ def checkout_page(tg_user_id: int) -> str:
             .summary-value {{
                 text-align: right;
                 color: #ffffff;
-                font-weight: 600;
+                font-weight: 700;
                 word-break: break-word;
             }}
 
             .action-btn {{
-                padding: 16px 18px;
+                max-width: 740px;
+                display: block;
+                margin: 0 auto;
+                padding: 18px 20px;
                 background: #f3f4f6;
                 color: #111111;
-                font-weight: 700;
+                font-weight: 800;
+                font-size: 18px;
             }}
 
             .secondary-btn {{
-                padding: 14px 18px;
+                max-width: 740px;
+                display: block;
+                margin: 14px auto 0;
+                padding: 15px 18px;
                 background: transparent;
                 color: #cbd5e1;
                 border: 1px solid rgba(255, 255, 255, 0.10);
-                margin-top: 12px;
+                font-size: 16px;
             }}
 
             .error {{
                 min-height: 18px;
-                margin-top: 10px;
+                margin: 10px auto 0;
+                max-width: 740px;
                 color: #fda4af;
                 font-size: 13px;
                 text-align: center;
             }}
 
             .footnote {{
-                margin-top: 18px;
+                max-width: 740px;
+                margin: 22px auto 0;
                 text-align: center;
-                color: #7d8593;
-                font-size: 12px;
-                line-height: 1.45;
+                color: #9ca3af;
+                font-size: 14px;
+                line-height: 1.5;
+            }}
+
+            @media (max-width: 900px) {{
+                .card {{
+                    max-width: 620px;
+                    padding: 32px 26px 24px;
+                }}
+
+                .logo {{
+                    width: 118px;
+                    height: 118px;
+                }}
+
+                h1 {{
+                    font-size: 34px;
+                    margin-top: 118px;
+                }}
+
+                .subtitle {{
+                    font-size: 17px;
+                }}
+
+                .option-btn {{
+                    font-size: 22px;
+                    padding: 24px 20px;
+                }}
+            }}
+
+            @media (max-width: 640px) {{
+                body {{
+                    padding: 16px;
+                }}
+
+                .card {{
+                    max-width: 100%;
+                    padding: 26px 18px 20px;
+                    border-radius: 24px;
+                }}
+
+                .logo {{
+                    width: 104px;
+                    height: 104px;
+                    top: 20px;
+                }}
+
+                h1 {{
+                    margin-top: 104px;
+                    font-size: 28px;
+                }}
+
+                .subtitle {{
+                    font-size: 16px;
+                    margin-bottom: 22px;
+                }}
+
+                .option-btn {{
+                    font-size: 20px;
+                    padding: 22px 16px;
+                }}
+
+                .footnote {{
+                    font-size: 13px;
+                }}
             }}
         </style>
     </head>
     <body>
         <div class="card">
-            <svg class="watermark" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-                <circle cx="100" cy="100" r="10" fill="white"/>
-                <circle
-                    cx="100"
-                    cy="100"
-                    r="62"
-                    stroke="white"
-                    stroke-width="14"
-                    stroke-linecap="round"
-                    stroke-dasharray="72 26 72 26 72 26 72 26"
-                    transform="rotate(-45 100 100)"
-                />
+            <svg class="logo" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <circle cx="100" cy="100" r="12" fill="white"/>
+                <path d="M100 24 A76 76 0 0 1 176 100" stroke="white" stroke-width="14" stroke-linecap="round"/>
+                <path d="M176 100 A76 76 0 0 1 100 176" stroke="white" stroke-width="14" stroke-linecap="round"/>
+                <path d="M100 176 A76 76 0 0 1 24 100" stroke="white" stroke-width="14" stroke-linecap="round"/>
+                <path d="M24 100 A76 76 0 0 1 100 24" stroke="white" stroke-width="14" stroke-linecap="round"/>
             </svg>
 
             <div class="content">
-                <div class="eyebrow">точка ясности</div>
-                <h1>Доступ в Точку опоры</h1>
-                <p class="subtitle">
-                    Выбери способ оплаты. Дальше система сама переведёт тебя на нужный маршрут.
-                </p>
+                <h1>Точка опоры - подписка на 1 месяц</h1>
+                <p class="subtitle">Выберите удобный вид оплаты</p>
 
                 <div id="step-method" class="step active">
                     <div class="stack">
                         <button class="option-btn" onclick="chooseMethod('rf_card')">
-                            <span class="title">Оплата картами РФ</span>
-                            <span class="desc">Рублёвый маршрут для карт российских банков.</span>
+                            Оплата картами РФ
                         </button>
 
                         <button class="option-btn" onclick="chooseMethod('foreign_card')">
-                            <span class="title">Оплата любой другой картой</span>
-                            <span class="desc">Маршрут для зарубежных карт с автоматической конвертацией.</span>
+                            Оплата любой другой картой
                         </button>
 
                         <button class="option-btn" onclick="chooseMethod('paypal')">
-                            <span class="title">PayPal</span>
-                            <span class="desc">Отдельный маршрут через PayPal.</span>
+                            PayPal
                         </button>
+                    </div>
+
+                    <div class="footnote">
+                        * При оплате картой оформляется автосписание каждые 30 дней.
                     </div>
                 </div>
 
@@ -1574,7 +1572,7 @@ def checkout_page(tg_user_id: int) -> str:
                     <div class="summary">
                         <div class="summary-row">
                             <div class="summary-label">Продукт</div>
-                            <div class="summary-value">Доступ в Точку опоры</div>
+                            <div class="summary-value">Точка опоры - подписка на 1 месяц</div>
                         </div>
                         <div class="summary-row">
                             <div class="summary-label">Способ оплаты</div>
@@ -1592,10 +1590,6 @@ def checkout_page(tg_user_id: int) -> str:
 
                     <button class="action-btn" onclick="goToPayment()">Перейти к оплате</button>
                     <button class="secondary-btn" onclick="showStep('step-email')">Вернуться назад</button>
-                </div>
-
-                <div class="footnote">
-                    Если после оплаты что-то пошло не так, просто вернись в Telegram и открой бота ещё раз.
                 </div>
             </div>
         </div>
@@ -1631,7 +1625,7 @@ def checkout_page(tg_user_id: int) -> str:
             }}
 
             function validateEmail(email) {{
-                const pattern = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{{2,}}$/;
+                const pattern = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{{2,}}$/;
                 return pattern.test(String(email).trim());
             }}
 
@@ -1792,10 +1786,7 @@ def create_payment(
             raise HTTPException(status_code=400, detail="Не передан способ оплаты")
         normalized_currency = normalize_currency(currency)
         normalized_route = normalize_payment_route(route)
-        payment_route_label = get_payment_route_label(
-            normalized_currency,
-            normalized_route,
-        )
+        payment_route_label = get_payment_route_label(normalized_currency, normalized_route)
 
     result = create_lava_invoice(
         email=email,
@@ -1808,10 +1799,7 @@ def create_payment(
     status = result.get("status", "new")
 
     if not payment_url:
-        raise HTTPException(
-            status_code=502,
-            detail="Lava не вернула paymentUrl",
-        )
+        raise HTTPException(status_code=502, detail="Lava не вернула paymentUrl")
 
     save_user_email(tg_user_id, email)
 
