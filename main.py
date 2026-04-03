@@ -1489,7 +1489,7 @@ async def run_bot() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command)
+    application.add_handler(CommandHandler("help", help_command))
                             application.add_handler(CommandHandler("chatid", chatid_command))
     application.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
