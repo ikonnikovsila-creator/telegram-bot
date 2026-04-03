@@ -1346,6 +1346,24 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     save_user(update)
 
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    # В группах и каналах бот молчит.
+    # Чтобы не засорять чат и не светить кнопку подписки всем участникам.
+    if chat.type in {"group", "supergroup", "channel"}:
+        return
+
+    await update.message.reply_text(
+        "Нажми кнопку ниже, чтобы открыть доступ в канал и чат.",
+        reply_markup=build_start_keyboard(update.effective_user.id),
+    )
+    if not update.message or not update.effective_user:
+        return
+
+    save_user(update)
+
     await update.message.reply_text(
         "Нажми кнопку ниже, чтобы открыть доступ в канал и чат.",
         reply_markup=build_start_keyboard(update.effective_user.id),
