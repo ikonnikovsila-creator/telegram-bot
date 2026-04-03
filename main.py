@@ -72,8 +72,6 @@ LAVA_SUBSCRIPTION_OFFER_ID = os.getenv(
 )
 DEFAULT_PERIODICITY = "MONTHLY"
 
-# Эти env нужны только для отображения стоимости на экране подтверждения.
-# Если оставить пустыми - строка "Стоимость" просто не покажется.
 DISPLAY_PRICE_RF = os.getenv("DISPLAY_PRICE_RF", "")
 DISPLAY_PRICE_FOREIGN = os.getenv("DISPLAY_PRICE_FOREIGN", "")
 DISPLAY_PRICE_PAYPAL = os.getenv("DISPLAY_PRICE_PAYPAL", "")
@@ -278,7 +276,7 @@ def init_db() -> None:
             """
         )
 
-        # Старые поля оставляем, чтобы не падать на уже существующей базе.
+        # Старые поля оставляем, чтобы база не падала на уже существующей схеме.
         cur.execute(
             """
             ALTER TABLE invoices
@@ -1338,12 +1336,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         START_TEXT,
         reply_markup=build_start_keyboard(update.effective_user.id),
     )
+
+
 async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.effective_user:
+    if not update.effective_chat or not update.message:
         return
 
     chat = update.effective_chat
-    user = update.effective_user
 
     text = (
         f"Chat title: {chat.title or '—'}\n"
@@ -1351,10 +1350,8 @@ async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Chat ID: {chat.id}"
     )
 
-    try:
-        await context.bot.send_message(chat_id=user.id, text=text)
-    except Exception:
-        pass
+    await update.message.reply_text(text)
+
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
@@ -1366,19 +1363,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not chat:
         return
 
-    # В группах и каналах бот молчит.
-    # Чтобы не засорять чат и не светить кнопку подписки всем участникам.
     if chat.type in {"group", "supergroup", "channel"}:
         return
-
-    await update.message.reply_text(
-        "Нажми кнопку ниже, чтобы открыть доступ в канал и чат.",
-        reply_markup=build_start_keyboard(update.effective_user.id),
-    )
-    if not update.message or not update.effective_user:
-        return
-
-    save_user(update)
 
     await update.message.reply_text(
         "Нажми кнопку ниже, чтобы открыть доступ в канал и чат.",
