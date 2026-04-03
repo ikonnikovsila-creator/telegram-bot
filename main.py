@@ -53,6 +53,10 @@ PRIVATE_CHANNEL_CHAT_ID = os.getenv("PRIVATE_CHANNEL_CHAT_ID")
 if not PRIVATE_CHANNEL_CHAT_ID:
     raise RuntimeError("PRIVATE_CHANNEL_CHAT_ID не найден в переменных окружения")
 
+PRIVATE_DISCUSSION_CHAT_ID = os.getenv("PRIVATE_DISCUSSION_CHAT_ID")
+if not PRIVATE_DISCUSSION_CHAT_ID:
+    raise RuntimeError("PRIVATE_DISCUSSION_CHAT_ID не найден в переменных окружения")
+
 PUBLIC_CHANNEL_CHAT_ID = os.getenv("PUBLIC_CHANNEL_CHAT_ID")
 if not PUBLIC_CHANNEL_CHAT_ID:
     raise RuntimeError("PUBLIC_CHANNEL_CHAT_ID не найден в переменных окружения")
@@ -78,19 +82,26 @@ ALLOWED_CURRENCIES = {"USD", "RUB"}
 ALLOWED_PAYMENT_ROUTES = {"CARD", "PAYPAL"}
 ALLOWED_PAYMENT_METHODS = {"rf_card", "foreign_card", "paypal"}
 
+ACCESS_STATUS_VALUES = {"subscription-active", "paid", "completed", "active", "success"}
+
+CHANNEL_KIND = "channel"
+CHAT_KIND = "chat"
+
 PUBLIC_ENTRY_POST_TEXT = (
     "Здесь не утешают, здесь проясняют.\n\n"
-    "Закрытый канал с доступом по подписке.\n"
-    "Внутри - тексты и разборы о тревоге, внимании, мыслях, отношениях и внутренней собранности.\n\n"
+    "Закрытый доступ по подписке.\n"
+    "Внутри - канал с текстами и разборами, закрытый чат для общения и эфиры только для подписчиков.\n\n"
     "Нажми на кнопку ниже.\n"
     "Дальше бот сам проведёт тебя по шагам."
 )
 
 START_TEXT = (
     "Точка опоры - подписка на 1 месяц.\n\n"
+    "После оплаты бот пришлёт 2 персональные ссылки:\n"
+    "1. в закрытый канал\n"
+    "2. в закрытый чат\n\n"
     "Нажми на кнопку ниже.\n"
-    "Откроется экран выбора оплаты.\n"
-    "После оплаты бот сам пришлёт персональную ссылку на вход в закрытый канал."
+    "Откроется экран выбора оплаты."
 )
 
 app = FastAPI()
@@ -150,10 +161,17 @@ def init_db() -> None:
                 payment_url TEXT,
                 status TEXT,
                 last_event_type TEXT,
-                access_invite_sent_at TIMESTAMP,
-                access_granted_at TIMESTAMP,
-                access_revoked_at TIMESTAMP,
-                pending_access_invite_link TEXT,
+
+                channel_access_invite_sent_at TIMESTAMP,
+                channel_access_granted_at TIMESTAMP,
+                channel_access_revoked_at TIMESTAMP,
+                pending_channel_invite_link TEXT,
+
+                chat_access_invite_sent_at TIMESTAMP,
+                chat_access_granted_at TIMESTAMP,
+                chat_access_revoked_at TIMESTAMP,
+                pending_chat_invite_link TEXT,
+
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW(),
                 last_webhook_type TEXT,
@@ -207,24 +225,78 @@ def init_db() -> None:
         cur.execute(
             """
             ALTER TABLE invoices
-            ADD COLUMN IF NOT EXISTS access_invite_sent_at TIMESTAMP
+            ADD COLUMN IF NOT EXISTS channel_access_invite_sent_at TIMESTAMP
             """
         )
 
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS channel_access_granted_at TIMESTAMP
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS channel_access_revoked_at TIMESTAMP
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS pending_channel_invite_link TEXT
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS chat_access_invite_sent_at TIMESTAMP
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS chat_access_granted_at TIMESTAMP
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS chat_access_revoked_at TIMESTAMP
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS pending_chat_invite_link TEXT
+            """
+        )
+
+        # Старые поля оставляем, чтобы не падать на уже существующей базе.
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS access_invite_sent_at TIMESTAMP
+            """
+        )
         cur.execute(
             """
             ALTER TABLE invoices
             ADD COLUMN IF NOT EXISTS access_granted_at TIMESTAMP
             """
         )
-
         cur.execute(
             """
             ALTER TABLE invoices
             ADD COLUMN IF NOT EXISTS access_revoked_at TIMESTAMP
             """
         )
-
         cur.execute(
             """
             ALTER TABLE invoices
@@ -726,13 +798,21 @@ def send_public_entry_post() -> dict:
     )
 
 
-def create_personal_join_request_link(label: str) -> str:
+def get_access_chat_id(access_kind: str) -> int:
+    if access_kind == CHANNEL_KIND:
+        return int(PRIVATE_CHANNEL_CHAT_ID)
+    if access_kind == CHAT_KIND:
+        return int(PRIVATE_DISCUSSION_CHAT_ID)
+    raise ValueError(f"Неизвестный access_kind: {access_kind}")
+
+
+def create_personal_join_request_link(access_kind: str, label: str) -> str:
     expire_at = int((datetime.now(timezone.utc) + timedelta(days=1)).timestamp())
 
     result = send_telegram_api_request(
         "createChatInviteLink",
         {
-            "chat_id": int(PRIVATE_CHANNEL_CHAT_ID),
+            "chat_id": get_access_chat_id(access_kind),
             "creates_join_request": True,
             "name": label[:32],
             "expire_date": expire_at,
@@ -741,47 +821,55 @@ def create_personal_join_request_link(label: str) -> str:
     return result["result"]["invite_link"]
 
 
-def approve_join_request(user_id: int) -> None:
+def approve_join_request(chat_id: int, user_id: int) -> None:
     send_telegram_api_request(
         "approveChatJoinRequest",
-        {"chat_id": int(PRIVATE_CHANNEL_CHAT_ID), "user_id": user_id},
+        {"chat_id": chat_id, "user_id": user_id},
     )
 
 
-def decline_join_request(user_id: int) -> None:
+def decline_join_request(chat_id: int, user_id: int) -> None:
     send_telegram_api_request(
         "declineChatJoinRequest",
-        {"chat_id": int(PRIVATE_CHANNEL_CHAT_ID), "user_id": user_id},
+        {"chat_id": chat_id, "user_id": user_id},
     )
 
 
-def remove_member_from_private_channel(user_id: int) -> None:
+def remove_member(chat_id: int, user_id: int) -> None:
     until_date = int((datetime.now(timezone.utc) + timedelta(seconds=60)).timestamp())
 
     try:
         send_telegram_api_request(
             "banChatMember",
             {
-                "chat_id": int(PRIVATE_CHANNEL_CHAT_ID),
+                "chat_id": chat_id,
                 "user_id": user_id,
                 "until_date": until_date,
                 "revoke_messages": False,
             },
         )
     except Exception:
-        logging.exception("Не удалось удалить пользователя из канала: user_id=%s", user_id)
+        logging.exception(
+            "Не удалось удалить пользователя: chat_id=%s user_id=%s",
+            chat_id,
+            user_id,
+        )
 
     try:
         send_telegram_api_request(
             "unbanChatMember",
             {
-                "chat_id": int(PRIVATE_CHANNEL_CHAT_ID),
+                "chat_id": chat_id,
                 "user_id": user_id,
                 "only_if_banned": True,
             },
         )
     except Exception:
-        logging.exception("Не удалось снять временный бан после удаления: user_id=%s", user_id)
+        logging.exception(
+            "Не удалось снять временный бан после удаления: chat_id=%s user_id=%s",
+            chat_id,
+            user_id,
+        )
 
 
 def resolve_invoice_row(
@@ -798,44 +886,49 @@ def resolve_invoice_row(
                 id,
                 telegram_user_id,
                 status,
-                access_invite_sent_at,
-                access_granted_at,
-                access_revoked_at,
-                pending_access_invite_link
+
+                channel_access_invite_sent_at,
+                channel_access_granted_at,
+                channel_access_revoked_at,
+                pending_channel_invite_link,
+
+                chat_access_invite_sent_at,
+                chat_access_granted_at,
+                chat_access_revoked_at,
+                pending_chat_invite_link
             FROM invoices
             WHERE {condition}
             LIMIT 1
         """
+
+        def row_to_dict(row: tuple) -> dict:
+            return {
+                "id": row[0],
+                "telegram_user_id": row[1],
+                "status": row[2],
+                "channel_access_invite_sent_at": row[3],
+                "channel_access_granted_at": row[4],
+                "channel_access_revoked_at": row[5],
+                "pending_channel_invite_link": row[6],
+                "chat_access_invite_sent_at": row[7],
+                "chat_access_granted_at": row[8],
+                "chat_access_revoked_at": row[9],
+                "pending_chat_invite_link": row[10],
+            }
 
         if lava_invoice_id:
             cur.execute(select_sql.format(condition="lava_invoice_id = %s"), (lava_invoice_id,))
             row = cur.fetchone()
             if row:
                 cur.close()
-                return {
-                    "id": row[0],
-                    "telegram_user_id": row[1],
-                    "status": row[2],
-                    "access_invite_sent_at": row[3],
-                    "access_granted_at": row[4],
-                    "access_revoked_at": row[5],
-                    "pending_access_invite_link": row[6],
-                }
+                return row_to_dict(row)
 
         if contract_id:
             cur.execute(select_sql.format(condition="contract_id = %s"), (contract_id,))
             row = cur.fetchone()
             if row:
                 cur.close()
-                return {
-                    "id": row[0],
-                    "telegram_user_id": row[1],
-                    "status": row[2],
-                    "access_invite_sent_at": row[3],
-                    "access_granted_at": row[4],
-                    "access_revoked_at": row[5],
-                    "pending_access_invite_link": row[6],
-                }
+                return row_to_dict(row)
 
         if buyer_email:
             cur.execute(
@@ -844,10 +937,16 @@ def resolve_invoice_row(
                     id,
                     telegram_user_id,
                     status,
-                    access_invite_sent_at,
-                    access_granted_at,
-                    access_revoked_at,
-                    pending_access_invite_link
+
+                    channel_access_invite_sent_at,
+                    channel_access_granted_at,
+                    channel_access_revoked_at,
+                    pending_channel_invite_link,
+
+                    chat_access_invite_sent_at,
+                    chat_access_granted_at,
+                    chat_access_revoked_at,
+                    pending_chat_invite_link
                 FROM invoices
                 WHERE LOWER(email) = %s
                 ORDER BY created_at DESC
@@ -858,15 +957,7 @@ def resolve_invoice_row(
             row = cur.fetchone()
             if row:
                 cur.close()
-                return {
-                    "id": row[0],
-                    "telegram_user_id": row[1],
-                    "status": row[2],
-                    "access_invite_sent_at": row[3],
-                    "access_granted_at": row[4],
-                    "access_revoked_at": row[5],
-                    "pending_access_invite_link": row[6],
-                }
+                return row_to_dict(row)
 
         cur.close()
         return None
@@ -923,58 +1014,102 @@ def update_invoice_from_webhook_resolved(
         conn.close()
 
 
-def mark_access_invite_sent(invoice_db_id: int, invite_link: str) -> None:
+def mark_access_invite_sent(invoice_db_id: int, access_kind: str, invite_link: str) -> None:
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE invoices
-            SET access_invite_sent_at = NOW(),
-                pending_access_invite_link = %s,
-                updated_at = NOW()
-            WHERE id = %s
-            """,
-            (invite_link, invoice_db_id),
-        )
+
+        if access_kind == CHANNEL_KIND:
+            cur.execute(
+                """
+                UPDATE invoices
+                SET channel_access_invite_sent_at = NOW(),
+                    pending_channel_invite_link = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (invite_link, invoice_db_id),
+            )
+        elif access_kind == CHAT_KIND:
+            cur.execute(
+                """
+                UPDATE invoices
+                SET chat_access_invite_sent_at = NOW(),
+                    pending_chat_invite_link = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (invite_link, invoice_db_id),
+            )
+        else:
+            raise ValueError(f"Неизвестный access_kind: {access_kind}")
+
         conn.commit()
         cur.close()
     finally:
         conn.close()
 
 
-def mark_access_granted(invoice_db_id: int) -> None:
+def mark_access_granted(invoice_db_id: int, access_kind: str) -> None:
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE invoices
-            SET access_granted_at = NOW(),
-                access_revoked_at = NULL,
-                pending_access_invite_link = NULL,
-                updated_at = NOW()
-            WHERE id = %s
-            """,
-            (invoice_db_id,),
-        )
+
+        if access_kind == CHANNEL_KIND:
+            cur.execute(
+                """
+                UPDATE invoices
+                SET channel_access_granted_at = NOW(),
+                    channel_access_revoked_at = NULL,
+                    pending_channel_invite_link = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (invoice_db_id,),
+            )
+        elif access_kind == CHAT_KIND:
+            cur.execute(
+                """
+                UPDATE invoices
+                SET chat_access_granted_at = NOW(),
+                    chat_access_revoked_at = NULL,
+                    pending_chat_invite_link = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (invoice_db_id,),
+            )
+        else:
+            raise ValueError(f"Неизвестный access_kind: {access_kind}")
+
         conn.commit()
         cur.close()
     finally:
         conn.close()
 
 
-def mark_access_revoked(invoice_db_id: int) -> None:
+def mark_all_access_revoked(invoice_db_id: int) -> None:
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
             """
             UPDATE invoices
-            SET access_revoked_at = NOW(),
+            SET channel_access_revoked_at = NOW(),
+                channel_access_granted_at = NULL,
+                channel_access_invite_sent_at = NULL,
+                pending_channel_invite_link = NULL,
+
+                chat_access_revoked_at = NOW(),
+                chat_access_granted_at = NULL,
+                chat_access_invite_sent_at = NULL,
+                pending_chat_invite_link = NULL,
+
+                access_revoked_at = NOW(),
                 access_granted_at = NULL,
                 access_invite_sent_at = NULL,
                 pending_access_invite_link = NULL,
+
                 updated_at = NOW()
             WHERE id = %s
             """,
@@ -986,35 +1121,93 @@ def mark_access_revoked(invoice_db_id: int) -> None:
         conn.close()
 
 
-def get_invoice_by_pending_link(invite_link: str) -> Optional[dict]:
+def get_invoice_by_pending_link(access_kind: str, invite_link: str) -> Optional[dict]:
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, telegram_user_id, status, pending_access_invite_link
-            FROM invoices
-            WHERE pending_access_invite_link = %s
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (invite_link,),
-        )
+
+        if access_kind == CHANNEL_KIND:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    telegram_user_id,
+                    status,
+                    pending_channel_invite_link,
+                    pending_chat_invite_link
+                FROM invoices
+                WHERE pending_channel_invite_link = %s
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (invite_link,),
+            )
+        elif access_kind == CHAT_KIND:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    telegram_user_id,
+                    status,
+                    pending_channel_invite_link,
+                    pending_chat_invite_link
+                FROM invoices
+                WHERE pending_chat_invite_link = %s
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (invite_link,),
+            )
+        else:
+            raise ValueError(f"Неизвестный access_kind: {access_kind}")
+
         row = cur.fetchone()
         cur.close()
+
         if not row:
             return None
+
         return {
             "id": row[0],
             "telegram_user_id": row[1],
             "status": row[2],
-            "pending_access_invite_link": row[3],
+            "pending_channel_invite_link": row[3],
+            "pending_chat_invite_link": row[4],
         }
     finally:
         conn.close()
 
 
-def send_access_request_link_if_paid(
+def build_paid_access_message(
+    channel_invite_link: Optional[str],
+    chat_invite_link: Optional[str],
+) -> str:
+    parts = ["Оплата подтверждена.\n"]
+
+    if channel_invite_link:
+        parts.append(
+            "1. Твоя персональная ссылка для входа в закрытый канал:\n"
+            f"{channel_invite_link}\n"
+        )
+
+    if chat_invite_link:
+        parts.append(
+            "2. Твоя персональная ссылка для входа в закрытый чат:\n"
+            f"{chat_invite_link}\n"
+        )
+
+    parts.append(
+        "Важно:\n"
+        "- каждая ссылка привязана к заявке на вход;\n"
+        "- если её откроет другой аккаунт, вход не будет одобрен;\n"
+        "- открой обе ссылки со своего Telegram-аккаунта;\n"
+        "- сначала зайди в канал, потом в чат."
+    )
+
+    return "\n".join(parts)
+
+
+def send_access_request_links_if_paid(
     invoice_row: dict,
     event_type: Optional[str],
     status: Optional[str],
@@ -1028,37 +1221,52 @@ def send_access_request_link_if_paid(
         )
         return
 
-    if invoice_row.get("access_granted_at"):
-        logging.info("Access already granted for invoice db id=%s", invoice_row["id"])
-        return
-
-    if invoice_row.get("access_invite_sent_at") and invoice_row.get("pending_access_invite_link"):
-        logging.info("Access join-request link already sent for invoice db id=%s", invoice_row["id"])
-        return
-
     telegram_user_id = invoice_row.get("telegram_user_id")
     if not telegram_user_id:
         logging.warning("telegram_user_id not found for invoice db id=%s", invoice_row["id"])
         return
 
-    label = f"paid-{contract_id or invoice_row['id']}"
-    invite_link = create_personal_join_request_link(label)
+    channel_invite_link = invoice_row.get("pending_channel_invite_link")
+    chat_invite_link = invoice_row.get("pending_chat_invite_link")
+
+    created_any_link = False
+
+    if not invoice_row.get("channel_access_granted_at") and not channel_invite_link:
+        label = f"channel-{contract_id or invoice_row['id']}"
+        channel_invite_link = create_personal_join_request_link(CHANNEL_KIND, label)
+        mark_access_invite_sent(invoice_row["id"], CHANNEL_KIND, channel_invite_link)
+        created_any_link = True
+
+    if not invoice_row.get("chat_access_granted_at") and not chat_invite_link:
+        label = f"chat-{contract_id or invoice_row['id']}"
+        chat_invite_link = create_personal_join_request_link(CHAT_KIND, label)
+        mark_access_invite_sent(invoice_row["id"], CHAT_KIND, chat_invite_link)
+        created_any_link = True
+
+    already_fully_granted = bool(
+        invoice_row.get("channel_access_granted_at") and invoice_row.get("chat_access_granted_at")
+    )
+    if already_fully_granted:
+        logging.info("Access already fully granted for invoice db id=%s", invoice_row["id"])
+        return
+
+    if not created_any_link:
+        logging.info(
+            "Access links already created and sent earlier for invoice db id=%s",
+            invoice_row["id"],
+        )
+        return
 
     send_telegram_text(
         telegram_user_id,
-        "Оплата подтверждена.\n\n"
-        "Вот твоя персональная ссылка для входа в закрытый канал:\n"
-        f"{invite_link}\n\n"
-        "Важно:\n"
-        "- ссылка привязана к заявке на вход;\n"
-        "- если её откроет другой аккаунт, вход не будет одобрен;\n"
-        "- открой её со своего Telegram-аккаунта.",
+        build_paid_access_message(
+            channel_invite_link=channel_invite_link,
+            chat_invite_link=chat_invite_link,
+        ),
     )
 
-    mark_access_invite_sent(invoice_row["id"], invite_link)
-
     logging.info(
-        "Access join-request link sent: invoice_db_id=%s telegram_user_id=%s",
+        "Access links sent: invoice_db_id=%s telegram_user_id=%s",
         invoice_row["id"],
         telegram_user_id,
     )
@@ -1073,8 +1281,12 @@ def revoke_access_if_needed(invoice_row: dict, event_type: Optional[str], status
         return
 
     had_access_or_pending = bool(
-        invoice_row.get("access_granted_at") or invoice_row.get("access_invite_sent_at")
+        invoice_row.get("channel_access_granted_at")
+        or invoice_row.get("channel_access_invite_sent_at")
+        or invoice_row.get("chat_access_granted_at")
+        or invoice_row.get("chat_access_invite_sent_at")
     )
+
     if not had_access_or_pending:
         logging.info(
             "Failure webhook received, but access was not granted yet: invoice_db_id=%s",
@@ -1082,14 +1294,15 @@ def revoke_access_if_needed(invoice_row: dict, event_type: Optional[str], status
         )
         return
 
-    remove_member_from_private_channel(telegram_user_id)
-    mark_access_revoked(invoice_row["id"])
+    remove_member(int(PRIVATE_CHANNEL_CHAT_ID), telegram_user_id)
+    remove_member(int(PRIVATE_DISCUSSION_CHAT_ID), telegram_user_id)
+    mark_all_access_revoked(invoice_row["id"])
 
     try:
         send_telegram_text(
             telegram_user_id,
             "Подписка не продлена.\n"
-            "Доступ в канал остановлен.\n\n"
+            "Доступ в закрытый канал и закрытый чат остановлен.\n\n"
             "Чтобы вернуться, снова открой бота и оформи подписку заново.",
         )
     except Exception:
@@ -1134,9 +1347,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     save_user(update)
 
     await update.message.reply_text(
-        "Нажми кнопку ниже, чтобы открыть доступ.",
+        "Нажми кнопку ниже, чтобы открыть доступ в канал и чат.",
         reply_markup=build_start_keyboard(update.effective_user.id),
     )
+
+
+def resolve_access_kind_by_chat_id(chat_id: int) -> Optional[str]:
+    if str(chat_id) == str(PRIVATE_CHANNEL_CHAT_ID):
+        return CHANNEL_KIND
+    if str(chat_id) == str(PRIVATE_DISCUSSION_CHAT_ID):
+        return CHAT_KIND
+    return None
 
 
 async def handle_chat_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1156,49 +1377,77 @@ async def handle_chat_join_request(update: Update, context: ContextTypes.DEFAULT
         invite_link,
     )
 
-    if str(chat_id) != str(PRIVATE_CHANNEL_CHAT_ID):
+    access_kind = resolve_access_kind_by_chat_id(chat_id)
+    if not access_kind:
         logging.info("Join request ignored: wrong chat_id=%s", chat_id)
         return
 
     if not invite_link:
-        decline_join_request(user_id)
+        decline_join_request(chat_id, user_id)
         logging.warning("Join request declined: no invite_link user_id=%s", user_id)
         return
 
-    invoice_row = get_invoice_by_pending_link(invite_link)
+    invoice_row = get_invoice_by_pending_link(access_kind, invite_link)
     if not invoice_row:
-        decline_join_request(user_id)
-        logging.warning("Join request declined: invite link not found user_id=%s", user_id)
+        decline_join_request(chat_id, user_id)
+        logging.warning(
+            "Join request declined: invite link not found access_kind=%s user_id=%s",
+            access_kind,
+            user_id,
+        )
         return
 
     expected_user_id = invoice_row["telegram_user_id"]
     status = (invoice_row.get("status") or "").strip().lower()
 
     if expected_user_id != user_id:
-        decline_join_request(user_id)
+        decline_join_request(chat_id, user_id)
         logging.warning(
-            "Join request declined: wrong user expected=%s actual=%s",
+            "Join request declined: wrong user expected=%s actual=%s access_kind=%s",
             expected_user_id,
             user_id,
+            access_kind,
         )
         return
 
-    if status not in {"subscription-active", "paid", "completed", "active", "success"}:
-        decline_join_request(user_id)
+    if status not in ACCESS_STATUS_VALUES:
+        decline_join_request(chat_id, user_id)
         logging.warning(
-            "Join request declined: invoice status is not active enough status=%s user_id=%s",
+            "Join request declined: invoice status is not active enough status=%s user_id=%s access_kind=%s",
             status,
             user_id,
+            access_kind,
         )
         return
 
-    approve_join_request(user_id)
-    mark_access_granted(invoice_row["id"])
+    approve_join_request(chat_id, user_id)
+    mark_access_granted(invoice_row["id"], access_kind)
+
+    try:
+        if access_kind == CHANNEL_KIND:
+            send_telegram_text(
+                user_id,
+                "Вход в закрытый канал одобрен.\n"
+                "Теперь открой персональную ссылку на чат и отправь заявку туда.",
+            )
+        else:
+            send_telegram_text(
+                user_id,
+                "Вход в закрытый чат одобрен.\n"
+                "Доступ полностью открыт.",
+            )
+    except Exception:
+        logging.exception(
+            "Не удалось отправить уведомление после approve: user_id=%s access_kind=%s",
+            user_id,
+            access_kind,
+        )
 
     logging.info(
-        "Join request approved: invoice_db_id=%s user_id=%s",
+        "Join request approved: invoice_db_id=%s user_id=%s access_kind=%s",
         invoice_row["id"],
         user_id,
+        access_kind,
     )
 
 
@@ -1533,7 +1782,7 @@ def checkout_page(tg_user_id: int) -> str:
 
             <div class="content">
                 <h1>Точка опоры - подписка на 1 месяц</h1>
-                <p class="subtitle">Выберите удобный вид оплаты</p>
+                <p class="subtitle">После оплаты бот пришлёт доступ в закрытый канал и закрытый чат</p>
 
                 <div id="step-method" class="step active">
                     <div class="stack">
@@ -1559,7 +1808,7 @@ def checkout_page(tg_user_id: int) -> str:
                     <label class="label" for="email">Введите ваш email</label>
                     <input id="email" class="input" type="email" placeholder="name@example.com" autocomplete="email">
                     <div class="hint">
-                        На этот email будет привязана оплата. После подтверждения бот пришлёт ссылку на вход в закрытый канал.
+                        На этот email будет привязана оплата. После подтверждения бот пришлёт 2 персональные ссылки - в закрытый канал и в закрытый чат.
                     </div>
                     <div class="error" id="email-error"></div>
                     <button class="action-btn" style="margin-top: 18px;" onclick="goToConfirm()">Далее</button>
@@ -1571,6 +1820,10 @@ def checkout_page(tg_user_id: int) -> str:
                         <div class="summary-row">
                             <div class="summary-label">Продукт</div>
                             <div class="summary-value">Точка опоры - подписка на 1 месяц</div>
+                        </div>
+                        <div class="summary-row">
+                            <div class="summary-label">Что входит</div>
+                            <div class="summary-value">Закрытый канал + закрытый чат</div>
                         </div>
                         <div class="summary-row">
                             <div class="summary-label">Способ оплаты</div>
@@ -1739,7 +1992,7 @@ def success_page() -> str:
         <div class="card">
             <h1>Оплата почти завершена.</h1>
             <p>Если платёж уже прошёл, вернись в Telegram.</p>
-            <p>После подтверждения оплаты бот пришлёт персональную ссылку на вход в закрытый канал.</p>
+            <p>После подтверждения оплаты бот пришлёт персональные ссылки на вход в закрытый канал и закрытый чат.</p>
             <a class="btn" href="{TELEGRAM_BOT_URL}">Открыть Telegram</a>
             <div class="note">Если Telegram не открылся автоматически, нажми кнопку ещё раз.</div>
         </div>
@@ -1908,7 +2161,7 @@ async def handle_lava_webhook(
         status=status,
     )
 
-    send_access_request_link_if_paid(
+    send_access_request_links_if_paid(
         invoice_row=invoice_row,
         event_type=event_type,
         status=status,
