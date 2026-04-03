@@ -1338,7 +1338,23 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         START_TEXT,
         reply_markup=build_start_keyboard(update.effective_user.id),
     )
+async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.effective_user:
+        return
 
+    chat = update.effective_chat
+    user = update.effective_user
+
+    text = (
+        f"Chat title: {chat.title or '—'}\n"
+        f"Chat type: {chat.type}\n"
+        f"Chat ID: {chat.id}"
+    )
+
+    try:
+        await context.bot.send_message(chat_id=user.id, text=text)
+    except Exception:
+        pass
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
@@ -1473,7 +1489,8 @@ async def run_bot() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("help", help_command)
+                            application.add_handler(CommandHandler("chatid", chatid_command))
     application.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
