@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -81,6 +82,9 @@ ALLOWED_PAYMENT_ROUTES = {"CARD", "PAYPAL"}
 ALLOWED_PAYMENT_METHODS = {"rf_card", "foreign_card", "paypal"}
 
 ACCESS_STATUS_VALUES = {"subscription-active", "paid", "completed", "active", "success"}
+
+REVOKE_WORKER_INTERVAL_SECONDS = int(os.getenv("REVOKE_WORKER_INTERVAL_SECONDS", "600"))
+WEBHOOK_ALLOWED_KEYS = {key for key in {LAVA_WEBHOOK_API_KEY, LAVA_PUBLIC_API_KEY} if key}
 
 CHANNEL_KIND = "channel"
 CHAT_KIND = "chat"
@@ -327,6 +331,27 @@ def init_db() -> None:
             """
             ALTER TABLE payments
             ADD COLUMN IF NOT EXISTS status TEXT
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMP
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS revoke_last_attempt_at TIMESTAMP
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE invoices
+            ADD COLUMN IF NOT EXISTS revoke_last_error TEXT
             """
         )
 
@@ -651,6 +676,42 @@ def extract_product_title(payload: dict) -> Optional[str]:
     return None
 
 
+def parse_lava_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        logging.exception("Не удалось распарсить дату Lava: %s", raw)
+        return None
+
+
+def extract_access_expires_at(payload: dict) -> Optional[datetime]:
+    value = find_first_value(
+        payload,
+        {
+            "willExpireAt",
+            "will_expire_at",
+            "expiresAt",
+            "expires_at",
+            "expiredAt",
+            "expired_at",
+            "paidTill",
+            "paid_till",
+            "activeUntil",
+            "active_until",
+            "nextPaymentAt",
+            "next_payment_at",
+        },
+    )
+    return parse_lava_datetime(value)
+
+
 def build_invoice_payload(email: str, currency: str, payment_route: str) -> dict:
     currency = normalize_currency(currency)
     payment_route = normalize_payment_route(payment_route)
@@ -737,19 +798,59 @@ def is_failed_or_inactive_payment(event_type: Optional[str], status: Optional[st
     normalized_event = (event_type or "").strip().lower()
     normalized_status = (status or "").strip().lower()
 
-    failed_events = {"payment.failed", "payment_failed", "subscription.payment.failed"}
-    failed_statuses = {
+    inactive_events = {
+        "payment.failed",
+        "payment_failed",
+        "subscription.payment.failed",
+        "subscription.cancelled",
+        "subscription.canceled",
+        "subscription.expired",
+        "subscription.inactive",
+        "subscription.deleted",
+    }
+
+    inactive_statuses = {
         "subscription-failed",
+        "subscription-cancelled",
+        "subscription-canceled",
+        "subscription-expired",
         "failed",
         "declined",
         "expired",
         "inactive",
         "cancelled",
         "canceled",
+        "cancelled_at_period_end",
+        "canceled_at_period_end",
     }
 
-    return normalized_event in failed_events or normalized_status in failed_statuses
+    return normalized_event in inactive_events or normalized_status in inactive_statuses
 
+
+def is_cancelled_but_still_active(payload: dict, event_type: Optional[str]) -> bool:
+    normalized_event = (event_type or "").strip().lower()
+    if normalized_event not in {"subscription.cancelled", "subscription.canceled"}:
+        return False
+
+    access_expires_at = extract_access_expires_at(payload)
+    if access_expires_at is None:
+        return False
+
+    return datetime.now(timezone.utc) < access_expires_at
+
+
+def should_revoke_access_now(payload: dict, event_type: Optional[str], status: Optional[str]) -> bool:
+    if not is_failed_or_inactive_payment(event_type, status):
+        return False
+
+    # LavaTop может прислать subscription.cancelled заранее:
+    # пользователь отменил автопродление, но доступ живёт до willExpireAt.
+    # В таком случае мы НЕ удаляем сразу, а записываем дату окончания
+    # и фоновый воркер удалит пользователя после access_expires_at.
+    if is_cancelled_but_still_active(payload, event_type):
+        return False
+
+    return True
 
 def send_telegram_api_request(method: str, payload: dict) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
@@ -833,7 +934,7 @@ def decline_join_request(chat_id: int, user_id: int) -> None:
     )
 
 
-def remove_member(chat_id: int, user_id: int) -> None:
+def remove_member(chat_id: int, user_id: int) -> bool:
     until_date = int((datetime.now(timezone.utc) + timedelta(seconds=60)).timestamp())
 
     try:
@@ -846,14 +947,8 @@ def remove_member(chat_id: int, user_id: int) -> None:
                 "revoke_messages": False,
             },
         )
-    except Exception:
-        logging.exception(
-            "Не удалось удалить пользователя: chat_id=%s user_id=%s",
-            chat_id,
-            user_id,
-        )
 
-    try:
+        # Сразу снимаем бан, чтобы человек мог вернуться после новой оплаты.
         send_telegram_api_request(
             "unbanChatMember",
             {
@@ -862,12 +957,18 @@ def remove_member(chat_id: int, user_id: int) -> None:
                 "only_if_banned": True,
             },
         )
-    except Exception:
+
+        logging.info("Пользователь удалён: chat_id=%s user_id=%s", chat_id, user_id)
+        return True
+
+    except Exception as exc:
         logging.exception(
-            "Не удалось снять временный бан после удаления: chat_id=%s user_id=%s",
+            "Не удалось удалить пользователя: chat_id=%s user_id=%s error=%s",
             chat_id,
             user_id,
+            str(exc),
         )
+        return False
 
 
 def resolve_invoice_row(
@@ -974,6 +1075,7 @@ def update_invoice_from_webhook_resolved(
     buyer_email: Optional[str],
     product_id: Optional[str],
     product_title: Optional[str],
+    access_expires_at: Optional[datetime],
 ) -> None:
     conn = get_connection()
     try:
@@ -988,6 +1090,7 @@ def update_invoice_from_webhook_resolved(
                 buyer_email = COALESCE(%s, buyer_email),
                 product_id = COALESCE(%s, product_id),
                 product_title = COALESCE(%s, product_title),
+                access_expires_at = COALESCE(%s, access_expires_at),
                 last_webhook_type = %s,
                 last_webhook_payload = %s,
                 updated_at = NOW()
@@ -1001,6 +1104,7 @@ def update_invoice_from_webhook_resolved(
                 buyer_email,
                 product_id,
                 product_title,
+                access_expires_at.replace(tzinfo=None) if access_expires_at else None,
                 webhook_type,
                 json.dumps(payload),
                 invoice_db_id,
@@ -1107,6 +1211,7 @@ def mark_all_access_revoked(invoice_db_id: int) -> None:
                 access_granted_at = NULL,
                 access_invite_sent_at = NULL,
                 pending_access_invite_link = NULL,
+                revoke_last_error = NULL,
 
                 updated_at = NOW()
             WHERE id = %s
@@ -1115,6 +1220,104 @@ def mark_all_access_revoked(invoice_db_id: int) -> None:
         )
         conn.commit()
         cur.close()
+    finally:
+        conn.close()
+
+
+def mark_revoke_attempt_failed(invoice_db_id: int, error_text: str) -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE invoices
+            SET revoke_last_attempt_at = NOW(),
+                revoke_last_error = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (error_text[:1000], invoice_db_id),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def set_invoice_access_expires_at(invoice_db_id: int, access_expires_at: datetime) -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE invoices
+            SET access_expires_at = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (access_expires_at.replace(tzinfo=None), invoice_db_id),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def get_due_access_rows(limit: int = 100) -> list[dict]:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                id,
+                telegram_user_id,
+                status,
+                channel_access_invite_sent_at,
+                channel_access_granted_at,
+                channel_access_revoked_at,
+                chat_access_invite_sent_at,
+                chat_access_granted_at,
+                chat_access_revoked_at,
+                access_expires_at
+            FROM invoices
+            WHERE access_expires_at IS NOT NULL
+              AND access_expires_at <= NOW()
+              AND telegram_user_id IS NOT NULL
+              AND (
+                    channel_access_granted_at IS NOT NULL
+                 OR channel_access_invite_sent_at IS NOT NULL
+                 OR chat_access_granted_at IS NOT NULL
+                 OR chat_access_invite_sent_at IS NOT NULL
+              )
+              AND (
+                    channel_access_revoked_at IS NULL
+                 OR chat_access_revoked_at IS NULL
+              )
+            ORDER BY access_expires_at ASC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+
+        rows = cur.fetchall()
+        cur.close()
+
+        return [
+            {
+                "id": row[0],
+                "telegram_user_id": row[1],
+                "status": row[2],
+                "channel_access_invite_sent_at": row[3],
+                "channel_access_granted_at": row[4],
+                "channel_access_revoked_at": row[5],
+                "chat_access_invite_sent_at": row[6],
+                "chat_access_granted_at": row[7],
+                "chat_access_revoked_at": row[8],
+                "access_expires_at": row[9],
+            }
+            for row in rows
+        ]
     finally:
         conn.close()
 
@@ -1270,13 +1473,11 @@ def send_access_request_links_if_paid(
     )
 
 
-def revoke_access_if_needed(invoice_row: dict, event_type: Optional[str], status: Optional[str]) -> None:
-    if not is_failed_or_inactive_payment(event_type, status):
-        return
-
+def revoke_access(invoice_row: dict, reason: str) -> bool:
     telegram_user_id = invoice_row.get("telegram_user_id")
     if not telegram_user_id:
-        return
+        logging.warning("Cannot revoke access: telegram_user_id empty invoice_db_id=%s", invoice_row.get("id"))
+        return False
 
     had_access_or_pending = bool(
         invoice_row.get("channel_access_granted_at")
@@ -1287,13 +1488,30 @@ def revoke_access_if_needed(invoice_row: dict, event_type: Optional[str], status
 
     if not had_access_or_pending:
         logging.info(
-            "Failure webhook received, but access was not granted yet: invoice_db_id=%s",
-            invoice_row["id"],
+            "Revoke skipped: access was not granted yet invoice_db_id=%s reason=%s",
+            invoice_row.get("id"),
+            reason,
         )
-        return
+        mark_all_access_revoked(invoice_row["id"])
+        return True
 
-    remove_member(int(PRIVATE_CHANNEL_CHAT_ID), telegram_user_id)
-    remove_member(int(PRIVATE_DISCUSSION_CHAT_ID), telegram_user_id)
+    channel_removed = remove_member(int(PRIVATE_CHANNEL_CHAT_ID), telegram_user_id)
+    chat_removed = remove_member(int(PRIVATE_DISCUSSION_CHAT_ID), telegram_user_id)
+
+    if not (channel_removed and chat_removed):
+        error_text = (
+            f"Telegram remove failed: channel_removed={channel_removed} "
+            f"chat_removed={chat_removed} reason={reason}"
+        )
+        mark_revoke_attempt_failed(invoice_row["id"], error_text)
+        logging.error(
+            "Access revoke failed: invoice_db_id=%s telegram_user_id=%s %s",
+            invoice_row["id"],
+            telegram_user_id,
+            error_text,
+        )
+        return False
+
     mark_all_access_revoked(invoice_row["id"])
 
     try:
@@ -1310,11 +1528,68 @@ def revoke_access_if_needed(invoice_row: dict, event_type: Optional[str], status
         )
 
     logging.info(
-        "Access revoked after failed/inactive payment: invoice_db_id=%s telegram_user_id=%s",
+        "Access revoked: invoice_db_id=%s telegram_user_id=%s reason=%s",
         invoice_row["id"],
         telegram_user_id,
+        reason,
     )
+    return True
 
+
+def revoke_access_if_needed(
+    invoice_row: dict,
+    payload: dict,
+    event_type: Optional[str],
+    status: Optional[str],
+) -> None:
+    access_expires_at = extract_access_expires_at(payload)
+    if access_expires_at:
+        set_invoice_access_expires_at(invoice_row["id"], access_expires_at)
+
+    if not is_failed_or_inactive_payment(event_type, status):
+        return
+
+    if is_cancelled_but_still_active(payload, event_type):
+        logging.info(
+            "Subscription cancelled but access remains until willExpireAt: invoice_db_id=%s expires_at=%s",
+            invoice_row["id"],
+            access_expires_at,
+        )
+        return
+
+    if should_revoke_access_now(payload, event_type, status):
+        revoke_access(
+            invoice_row=invoice_row,
+            reason=f"webhook event_type={event_type} status={status}",
+        )
+
+
+def revoke_due_access_once() -> int:
+    rows = get_due_access_rows()
+    revoked_count = 0
+
+    for row in rows:
+        if revoke_access(row, reason=f"access_expires_at={row.get('access_expires_at')}"):
+            revoked_count += 1
+
+    return revoked_count
+
+
+def periodic_revoke_worker() -> None:
+    while True:
+        try:
+            revoked_count = revoke_due_access_once()
+            if revoked_count:
+                logging.info("Periodic revoke worker: revoked_count=%s", revoked_count)
+        except Exception:
+            logging.exception("Periodic revoke worker failed")
+
+        time.sleep(REVOKE_WORKER_INTERVAL_SECONDS)
+
+
+def start_revoke_worker_in_background() -> None:
+    thread = Thread(target=periodic_revoke_worker, daemon=True)
+    thread.start()
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_user(update)
@@ -1499,11 +1774,21 @@ def startup_event() -> None:
     init_db()
     thread = Thread(target=start_bot_in_background, daemon=True)
     thread.start()
+    start_revoke_worker_in_background()
 
 
 @app.get("/")
 def root() -> dict:
     return {"status": "ok", "message": "Telegram bot is running"}
+
+
+@app.get("/admin/revoke-due")
+def admin_revoke_due(x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")) -> dict:
+    if x_api_key not in WEBHOOK_ALLOWED_KEYS:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    revoked_count = revoke_due_access_once()
+    return {"ok": True, "revoked_count": revoked_count}
 
 
 @app.get("/checkout", response_class=HTMLResponse)
@@ -2094,12 +2379,19 @@ async def handle_lava_webhook(
     request: Request,
     x_api_key: Optional[str],
 ) -> dict:
-    if x_api_key != LAVA_WEBHOOK_API_KEY:
+    authorization = request.headers.get("Authorization")
+    bearer_token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        bearer_token = authorization.split(" ", 1)[1].strip()
+
+    provided_key = x_api_key or bearer_token
+    if provided_key not in WEBHOOK_ALLOWED_KEYS:
         logging.warning(
-            "Lava webhook unauthorized: type=%s ip=%s x_api_key=%s",
+            "Lava webhook unauthorized: type=%s ip=%s x_api_key=%s authorization_present=%s",
             webhook_type,
             request.client.host if request.client else "unknown",
             x_api_key,
+            bool(authorization),
         )
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -2122,15 +2414,17 @@ async def handle_lava_webhook(
     buyer_email = extract_buyer_email(payload)
     product_id = extract_product_id(payload)
     product_title = extract_product_title(payload)
+    access_expires_at = extract_access_expires_at(payload)
 
     logging.info("Lava webhook parsed payload: %s", payload)
     logging.info(
-        "Lava webhook extracted invoice_id=%s contract_id=%s buyer_email=%s event_type=%s status=%s",
+        "Lava webhook extracted invoice_id=%s contract_id=%s buyer_email=%s event_type=%s status=%s access_expires_at=%s",
         lava_invoice_id,
         contract_id,
         buyer_email,
         event_type,
         status,
+        access_expires_at,
     )
 
     save_payment_webhook(
@@ -2174,10 +2468,16 @@ async def handle_lava_webhook(
         buyer_email=buyer_email,
         product_id=product_id,
         product_title=product_title,
+        access_expires_at=access_expires_at,
     )
+
+    # Обновляем локальную копию invoice_row, чтобы revoke видел свежую дату окончания.
+    if access_expires_at:
+        invoice_row["access_expires_at"] = access_expires_at
 
     revoke_access_if_needed(
         invoice_row=invoice_row,
+        payload=payload,
         event_type=event_type,
         status=status,
     )
